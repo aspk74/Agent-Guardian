@@ -1,0 +1,37 @@
+version: 1
+
+rules:
+  - id: FIN-001
+    description: Single payment over $500 needs a human
+    when: {action_type: make_payment, amount_cents_gt: 50000}
+    then: escalate
+
+  - id: FIN-002
+    description: Over $1000 by one agent in 24h needs a human
+    when: {action_type: make_payment, window_hours: 24, sum_amount_cents_gt: 100000}
+    then: escalate
+
+  - id: FIN-003
+    description: Unknown counterparties are denied
+    when: {action_type: make_payment, target_not_in: [acme-corp, globex, initech]}
+    then: deny
+
+  - id: FIN-004
+    description: Payments within limits to known counterparties are routine
+    when: {action_type: make_payment, target_in: [acme-corp, globex, initech]}
+    then: allow
+
+  - id: FILE-001
+    description: Production files are never deleted by an agent
+    when: {action_type: delete_file, target_glob: "*.prod.*"}
+    then: deny
+
+  - id: MAIL-001
+    description: External recipients need a human
+    when: {action_type: send_email, target_domain_not_in: [internal.example.com]}
+    then: escalate
+
+  - id: FILE-002
+    description: Reads inside the workspace are routine
+    when: {action_type: read_file, target_glob: "workspace/**"}
+    then: allow
