@@ -125,6 +125,16 @@ def test_file_001_prod_delete_denied():
     assert predicates.rule_matches(_file(ActionType.DELETE_FILE, "config.dev.yaml"), HISTORY, rule) is False
 
 
+def test_file_001_prod_delete_denied_case_insensitive():
+    """Regression: target_glob was left case-sensitive when target_in/
+    target_not_in/target_domain_not_in were made case-insensitive elsewhere
+    in this file. A mixed-case production filename must not slip past
+    FILE-001's deny guard and fall through to SYS-GAP escalate."""
+    rule = _rule("FILE-001")
+    assert predicates.rule_matches(_file(ActionType.DELETE_FILE, "Config.PROD.yaml"), HISTORY, rule) is True
+    assert predicates.rule_matches(_file(ActionType.DELETE_FILE, "CONFIG.PROD.YAML"), HISTORY, rule) is True
+
+
 def test_file_002_workspace_read_allowed():
     rule = _rule("FILE-002")
     assert predicates.rule_matches(_file(ActionType.READ_FILE, "workspace/report.md"), HISTORY, rule) is True

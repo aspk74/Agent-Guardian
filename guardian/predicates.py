@@ -69,7 +69,13 @@ def rule_matches(action: Action, history: "HistoryQuery", rule: dict) -> bool:
             return False
 
     if "target_glob" in when:
-        if not fnmatch.fnmatch(action.target, when["target_glob"]):
+        # fnmatch.fnmatchcase (not fnmatch.fnmatch, which is platform-
+        # dependent -- case-sensitive on POSIX, case-insensitive on
+        # Windows) on casefolded operands: consistent case-insensitivity
+        # everywhere, matching the target_not_in/target_in/target_domain_not_in
+        # fix above. A production-file deny relies on this exactly like
+        # FIN-003 did -- a mixed-case path must not slip past FILE-001.
+        if not fnmatch.fnmatchcase(action.target.casefold(), when["target_glob"].casefold()):
             return False
 
     if "target_domain_not_in" in when:
