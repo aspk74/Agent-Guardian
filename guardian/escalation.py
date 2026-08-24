@@ -8,7 +8,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 import db
-from schemas import ActionEnvelope, Decision, DecisionStatus
+import guardian.auditor as auditor
+import guardian.executors as executors
+from schemas import ActionEnvelope, Decision, DecisionStatus, Outcome
 
 
 class UnknownEscalation(Exception):
@@ -82,7 +84,8 @@ def resolve(conn, action_id: str, *, approved: bool, by: str) -> Decision:
         resolved_at=resolved_at,
     )
     if not won_race:
-        raise AlreadyResolved(f"{action_id} was resolved by a concurrent caller")
+        current_status = db.get_escalation(conn, action_id)["status"]
+        raise AlreadyResolved(f"{action_id} already {current_status}")
 
     final_status = DecisionStatus.ALLOW if approved else DecisionStatus.DENY
     return Decision(
@@ -94,4 +97,21 @@ def resolve(conn, action_id: str, *, approved: bool, by: str) -> Decision:
         reasoning=f"human {'approved' if approved else 'rejected'} by {by} (was: {stored_decision.reasoning})",
         decided_by="human",
         payload_hash=current_hash,
+    )
+
+
+def resolve_and_execute(conn, action_id: str, *, approved: bool, by: str) -> Outcome | None:
+    """Shared by main.py's CLI and dashboard.py's HTTP routes (PLAN.md s5:
+    "Phase 2 CLI and Phase 3 HTTP call the same three functions") -- this is
+    the fourth: resolve() plus, if approved, running the executor. Returns
+    None for a rejected/denied resolution (nothing executes)."""
+    decision = resolve(conn, action_id, approved=approved, by=by)
+    if decision.status is not DecisionStatus.ALLOW:
+        return None
+    row = db.get_escalation(conn, action_id)
+    action = ActionEnvelope.model_validate_json(row["envelope_json"]).action
+    return executors.run(
+        action, decision,
+        outcome_lookup=lambda aid: auditor.outcome_for(conn, aid),
+        outcome_record=lambda o: auditor.record_outcome(conn, o),
     )

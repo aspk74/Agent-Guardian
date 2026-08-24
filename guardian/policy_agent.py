@@ -40,6 +40,16 @@ _THEN_TO_STATUS = {
 }
 
 
+def policy_version(policy_path: str = "policy.yaml") -> str:
+    """sha256 of policy.yaml's current on-disk contents. evaluate() already
+    recomputes this on every call (no cache to invalidate), so this is the
+    read-only counterpart for callers -- the Phase 3 dashboard/CLI -- that
+    just want to confirm what version is currently live, without evaluating
+    an action."""
+    with open(policy_path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
 def evaluate(action: Action, history: HistoryQuery, policy_path: str = "policy.yaml") -> Decision:
     # policy.yaml missing/malformed is a startup-time failure (PLAN.md s3.3:
     # "refuse to start"). Let the exception propagate uncaught -- this is

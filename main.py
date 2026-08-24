@@ -25,9 +25,10 @@ load_dotenv()  # loads .env if present; never overwrites a var already set in th
 
 import db
 import guardian.auditor as auditor
+import guardian.coverage_check as coverage_check
 import guardian.escalation as esc
-import guardian.executors as executors
 import guardian.graph as graph
+import guardian.policy_agent as policy_agent
 from agents.finance_agent import FinanceAgent
 from demo_scenarios import SCENARIOS
 from schemas import ActionEnvelope, Decision, DecisionStatus
@@ -95,22 +96,6 @@ def _prompt_approval(envelope: ActionEnvelope, decision: Decision) -> bool:
         print("      please answer y or n")
 
 
-def _resolve_and_execute(conn, action_id: str, *, approved: bool, by: str):
-    decision = esc.resolve(conn, action_id, approved=approved, by=by)
-    if decision.status is not DecisionStatus.ALLOW:
-        return None
-    return executors.run(
-        _action_for(conn, action_id), decision,
-        outcome_lookup=lambda aid: auditor.outcome_for(conn, aid),
-        outcome_record=lambda o: auditor.record_outcome(conn, o),
-    )
-
-
-def _action_for(conn, action_id: str):
-    row = db.get_escalation(conn, action_id)
-    return ActionEnvelope.model_validate_json(row["envelope_json"]).action
-
-
 def cmd_run(name: str, session_id: str, *, db_path: str, by: str) -> None:
     if name not in SCENARIOS:
         print(f"Unknown scenario: {name}. Known: {list(SCENARIOS)}", file=sys.stderr)
@@ -144,7 +129,7 @@ def cmd_run(name: str, session_id: str, *, db_path: str, by: str) -> None:
             esc.park(conn, envelope, decision)
             try:
                 approved = _prompt_approval(envelope, decision)
-                outcome = _resolve_and_execute(conn, envelope.action.id, approved=approved, by=by)
+                outcome = esc.resolve_and_execute(conn, envelope.action.id, approved=approved, by=by)
             except NonInteractiveApproval as exc:
                 print(f"  outcome: none (stopped -- {exc})", file=sys.stderr)
                 sys.exit(1)
@@ -166,6 +151,33 @@ def cmd_run(name: str, session_id: str, *, db_path: str, by: str) -> None:
     actions_n = conn.execute("select count(*) from actions").fetchone()[0]
     decisions_n = conn.execute("select count(*) from decisions").fetchone()[0]
     print(f"\naudit trail: {actions_n} action(s), {decisions_n} decision(s) recorded in {db_path}")
+
+
+def cmd_policy_version(policy_path: str) -> None:
+    """PLAN.md s7 step 13: read-only check of what policy.yaml hash is
+    currently live. evaluate() already re-reads policy.yaml on every call,
+    so there is no separate reload step -- this just reports the version an
+    action proposed right now would be decided under."""
+    print(policy_agent.policy_version(policy_path))
+
+
+def cmd_coverage_check(policy_path: str) -> None:
+    """PLAN.md s7 step 14: advisory LLM scan for rule-set gaps. Never
+    produces a Decision and never runs in evaluate()'s path -- callable
+    on demand only (Phase 3 scope, confirmed with user: no automatic
+    triggering)."""
+    try:
+        report = coverage_check.run_coverage_check(policy_path)
+    except coverage_check.CoverageCheckError as exc:
+        print(f"coverage check failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+    print(f"policy_version: {report.policy_version}")
+    print(f"summary: {report.summary}")
+    if not report.findings:
+        print("no findings")
+        return
+    for f in report.findings:
+        print(f"  [{f.suggested_disposition}] {f.action_type}: {f.issue}")
 
 
 def cmd_report(session_id: str, db_path: str) -> None:
@@ -199,7 +211,7 @@ def cmd_resolve(*, db_path: str, session_id: str | None, by: str) -> None:
             print(f"  stopped: {exc}", file=sys.stderr)
             sys.exit(1)
         try:
-            outcome = _resolve_and_execute(conn, envelope.action.id, approved=approved, by=by)
+            outcome = esc.resolve_and_execute(conn, envelope.action.id, approved=approved, by=by)
         except (esc.AlreadyResolved, ValueError) as exc:
             # Rows are a snapshot from esc.pending() taken before this loop
             # started prompting; a concurrent resolver may have already
@@ -246,6 +258,12 @@ if __name__ == "__main__":
     p_report.add_argument("--session", required=True)
     p_report.add_argument("--db", default="guardian.db")
 
+    p_policy_version = sub.add_parser("policy-version", help="print the current policy.yaml sha256")
+    p_policy_version.add_argument("--policy", default="policy.yaml")
+
+    p_coverage = sub.add_parser("coverage-check", help="advisory LLM scan for rule-set gaps (escalate/deny findings only)")
+    p_coverage.add_argument("--policy", default="policy.yaml")
+
     args = parser.parse_args()
 
     if args.command == "run":
@@ -254,3 +272,7 @@ if __name__ == "__main__":
         cmd_resolve(db_path=args.db, session_id=args.session_id, by=args.by)
     elif args.command == "report":
         cmd_report(args.session, args.db)
+    elif args.command == "policy-version":
+        cmd_policy_version(args.policy)
+    elif args.command == "coverage-check":
+        cmd_coverage_check(args.policy)

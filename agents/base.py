@@ -21,19 +21,13 @@ names in `target_field` (e.g. FinanceAgent.target_field = "counterparty").
 from __future__ import annotations
 
 import json
-import re
 
 import openai
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
+from guardian.llm_json import PARSE_ERRORS as _PARSE_ERRORS
+from guardian.llm_json import strip_code_fence as _strip_code_fence
 from schemas import Action, ActionEnvelope, ActionType
-
-# Exceptions that indicate the LLM's response could not be turned into a
-# valid Action -- malformed JSON, missing keys, or params that fail the
-# params_model's validation. This is the one place in the codebase allowed
-# a broad-ish catch (PLAN.md s8: "ActionValidationError ... one retry, then
-# deny"), and it is a specific tuple, not `except Exception`.
-_PARSE_ERRORS = (json.JSONDecodeError, KeyError, TypeError, ValueError, ValidationError)
 
 
 class ActionValidationError(Exception):
@@ -42,24 +36,6 @@ class ActionValidationError(Exception):
     def __init__(self, message: str, raw_response: str):
         super().__init__(message)
         self.raw_response = raw_response
-
-
-_CODE_FENCE_RE = re.compile(r"^```[a-zA-Z]*\n?(.*?)\n?```$", re.DOTALL)
-
-
-def _strip_code_fence(text: str) -> str:
-    """Best-effort removal of a ```/```json wrapper, in case the model adds
-    one despite being told not to. Does not affect well-formed output.
-
-    A line-splitting approach here previously mishandled a fence collapsed
-    onto a single line (```{"a": 1}``` with no embedded newlines) by
-    stripping it down to an empty string -- caught by the JSONDecodeError
-    retry, but silently burning the one allotted retry on an otherwise valid
-    response. A regex match on the whole string, not line count, handles the
-    single-line and multi-line cases uniformly."""
-    stripped = text.strip()
-    match = _CODE_FENCE_RE.match(stripped)
-    return match.group(1).strip() if match else stripped
 
 
 class WorkerAgent:

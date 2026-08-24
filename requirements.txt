@@ -5,3 +5,7 @@ openai
 pytest
 hypothesis
 python-dotenv
+fastapi
+uvicorn
+python-multipart
+httpx

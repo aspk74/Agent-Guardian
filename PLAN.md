@@ -393,14 +393,35 @@ CREATE INDEX idx_outcomes_window
 
 **Exit:** demo scenario (s12) passes end to end.
 
-### Phase 3 — stretch
+### Phase 3 — stretch (done)
 
 12. FastAPI + HTML over the same `escalation.pending()` the CLI uses.
+    `dashboard.py`: `/` (HTML), `/pending` (JSON), `/resolve/{id}` (HTML
+    form), `/api/resolve/{id}` (JSON), `/policy-version`. No auth --
+    confirmed with user, local/demo use only, documented in the module
+    docstring as a known gap.
 13. Hot-reload `policy.yaml`. New `policy_version` on reload; parked
-    escalations keep their stored Decision (s2.2).
-14. LLM coverage check over the rule set. **Constrained: may return
-    `escalate` or `deny` only.** `allow` is reachable exclusively through a
-    deterministic rule match.
+    escalations keep their stored Decision (s2.2). `policy_agent.evaluate()`
+    already re-read policy.yaml on every call before Phase 3 (no in-process
+    cache to invalidate), so hot-reload for new actions was automatic;
+    `policy_agent.policy_version()` added as the read-only counterpart for
+    an operator to confirm the current on-disk hash without proposing an
+    action. Explicit CLI (`main.py policy-version`) and HTTP
+    (`GET /policy-version`) surfaces, not a file-watcher -- confirmed with
+    user. `tests/test_hot_reload.py` proves a parked escalation's stored
+    Decision/policy_version survive a live policy.yaml edit; verified again
+    live (uvicorn running, editing policy.yaml on disk, no restart).
+14. LLM coverage check over the rule set (`guardian/coverage_check.py`).
+    **Constrained: may return `escalate` or `deny` only** -- enforced by a
+    Pydantic `Literal["escalate", "deny"]` on `Finding.suggested_disposition`,
+    not by prompt wording alone; an `"allow"` response is rejected and
+    retried once, same one-retry pattern as `agents/base.py`. Callable only
+    (`main.py coverage-check`), no automatic triggering -- confirmed with
+    user.
+
+**Exit:** no auth on the dashboard (demo/local use), explicit reload trigger
+(not file-watch), hot-reload proven by test + live run. All confirmed with
+user as this phase's stretch-scope "done" criteria.
 
 ---
 
