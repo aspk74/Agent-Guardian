@@ -62,6 +62,16 @@ def _load_agents():
     return agents
 
 
+class NonInteractiveApproval(Exception):
+    """Raised when stdin hits EOF while an escalation is awaiting a human
+    answer -- e.g. this process was invoked without a real terminal attached.
+    Deliberately not a silent default in either direction: guessing "yes" on
+    a closed stdin could execute an action nobody approved, and guessing "no"
+    would misreport an unanswered escalation as a human rejection in the
+    audit trail. Callers must handle this rather than let a bare EOFError
+    crash the batch."""
+
+
 def _prompt_approval(envelope: ActionEnvelope, decision: Decision) -> bool:
     """Blocking interactive prompt. Returns True for approve, False for reject.
     Keeps asking until it gets 'y' or 'n' -- an escalation is exactly the case
@@ -72,7 +82,12 @@ def _prompt_approval(envelope: ActionEnvelope, decision: Decision) -> bool:
     print(f"      rule:  {decision.rule_id} -- {decision.reasoning}")
     print(f"      LLM reasoning (audit-only): {envelope.reasoning!r}")
     while True:
-        answer = input("      approve? [y/n]: ").strip().lower()
+        try:
+            answer = input("      approve? [y/n]: ").strip().lower()
+        except EOFError:
+            raise NonInteractiveApproval(
+                f"stdin closed while awaiting approval for action {envelope.action.id}"
+            ) from None
         if answer in ("y", "yes"):
             return True
         if answer in ("n", "no"):
@@ -127,8 +142,18 @@ def cmd_run(name: str, session_id: str, *, db_path: str, by: str) -> None:
 
         if decision.status is DecisionStatus.ESCALATE:
             esc.park(conn, envelope, decision)
-            approved = _prompt_approval(envelope, decision)
-            outcome = _resolve_and_execute(conn, envelope.action.id, approved=approved, by=by)
+            try:
+                approved = _prompt_approval(envelope, decision)
+                outcome = _resolve_and_execute(conn, envelope.action.id, approved=approved, by=by)
+            except NonInteractiveApproval as exc:
+                print(f"  outcome: none (stopped -- {exc})", file=sys.stderr)
+                sys.exit(1)
+            except esc.AlreadyResolved:
+                # Parked by this same call to esc.park() moments ago, so
+                # only a concurrent resolver could have already resolved it
+                # -- report and move on rather than crash the whole scenario.
+                print("  outcome: none (resolved by another process while awaiting this prompt)")
+                continue
             if outcome is None:
                 print("  outcome: none (rejected by human, never executed)")
             else:
@@ -166,15 +191,23 @@ def cmd_resolve(*, db_path: str, session_id: str | None, by: str) -> None:
     print(f"{len(rows)} pending escalation(s) in {db_path}")
     for row in rows:
         envelope, decision = row["envelope"], row["decision"]
-        approved = _prompt_approval(envelope, decision)
+        try:
+            approved = _prompt_approval(envelope, decision)
+        except NonInteractiveApproval as exc:
+            # stdin is gone -- every remaining row would hit the same EOF,
+            # so stop the batch here rather than loop into more failures.
+            print(f"  stopped: {exc}", file=sys.stderr)
+            sys.exit(1)
         try:
             outcome = _resolve_and_execute(conn, envelope.action.id, approved=approved, by=by)
-        except esc.AlreadyResolved:
+        except (esc.AlreadyResolved, ValueError) as exc:
             # Rows are a snapshot from esc.pending() taken before this loop
-            # started prompting; another process resolving the same row in
-            # the meantime (e.g. a concurrent `resolve` invocation) must not
-            # abandon every row still waiting behind it in this batch.
-            print("  skipped: resolved by another process while awaiting this prompt")
+            # started prompting; a concurrent resolver may have already
+            # resolved this exact row (AlreadyResolved), or -- far less
+            # likely -- its stored payload_hash no longer matches (ValueError,
+            # an inconsistent escalation record). Either way this ONE row's
+            # problem must not abandon every row still waiting behind it.
+            print(f"  skipped: {exc}")
             continue
         if outcome is None:
             print("  outcome: none (rejected by human, never executed)")
@@ -192,12 +225,22 @@ if __name__ == "__main__":
     p_run.add_argument("--db", default="guardian.db")  # persistent by design (resumability); pass a
                                                         # fresh --db or --session-id to avoid cross-run
                                                         # accumulation against cumulative policy caps (FIN-002)
-    p_run.add_argument("--by", default="cli-operator", help="identity recorded as the approver")
+    p_run.add_argument("--by", default="unattributed-operator", help="identity recorded as the approver -- "
+                                                        "always pass this explicitly when a real "
+                                                        "operator is approving; the default exists so "
+                                                        "it's visibly a placeholder, not a plausible name "
+                                                        "two different unattributed operators could be "
+                                                        "mistaken for the same person")
 
     p_resolve = sub.add_parser("resolve", help="resolve pending escalations (resumable after a kill)")
     p_resolve.add_argument("--db", default="guardian.db")
     p_resolve.add_argument("--session-id", default=None)
-    p_resolve.add_argument("--by", default="cli-operator", help="identity recorded as the approver")
+    p_resolve.add_argument("--by", default="unattributed-operator", help="identity recorded as the approver -- "
+                                                        "always pass this explicitly when a real "
+                                                        "operator is approving; the default exists so "
+                                                        "it's visibly a placeholder, not a plausible name "
+                                                        "two different unattributed operators could be "
+                                                        "mistaken for the same person")
 
     p_report = sub.add_parser("report", help="print the audit trail for a session")
     p_report.add_argument("--session", required=True)
