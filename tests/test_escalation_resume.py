@@ -18,6 +18,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 
 import db
@@ -76,6 +77,58 @@ def test_reopening_connection_sees_pending_row(tmp_path):
     row = db.get_escalation(conn2, envelope.action.id)
     assert row["status"] == "approved"
     assert row["resolved_by"] == "restarted-operator"
+
+
+def test_concurrent_resolve_only_one_caller_wins(tmp_path):
+    """Regression: caught by a code review that suspected (and a live
+    threaded reproduction confirmed) a TOCTOU race in esc.resolve() -- the
+    pending-status check and the resolving write were a separate read then
+    a separate write, so two callers racing on the same action_id could
+    both read status='pending' before either wrote, both pass, and both
+    return an executable ALLOW Decision. The outcomes table's primary key
+    on action_id happened to prevent an actual double-payment, but BOTH
+    callers received a false 'success' in their own process, and
+    escalations.resolved_by silently recorded only one operator's identity
+    -- the other's approval vanished from the audit trail with no error.
+
+    db.resolve_escalation()'s UPDATE now carries status='pending' in its
+    WHERE clause and reports (via rowcount) whether THIS call actually won;
+    esc.resolve() raises AlreadyResolved for the loser instead of both
+    callers proceeding. This test races two real threads against a real
+    file-backed db (not :memory:, so both threads share the same durable
+    state) and asserts exactly one wins."""
+    db_path = str(tmp_path / "race.db")
+    conn_setup = db.init_db(db_path)
+    envelope, decision = make_escalated_envelope_and_decision(action_id="act-race-1")
+    esc.park(conn_setup, envelope, decision)
+    conn_setup.close()
+
+    results: list[tuple[str, str]] = []
+
+    def worker(who: str) -> None:
+        conn = db.init_db(db_path)
+        try:
+            resolved = esc.resolve(conn, "act-race-1", approved=True, by=who)
+            results.append((who, "success", resolved.status))
+        except esc.AlreadyResolved as exc:
+            results.append((who, "already_resolved", str(exc)))
+        conn.close()
+
+    threads = [threading.Thread(target=worker, args=(f"operator-{i}",)) for i in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    successes = [r for r in results if r[1] == "success"]
+    already_resolved = [r for r in results if r[1] == "already_resolved"]
+    assert len(successes) == 1, f"exactly one caller should win the race, got: {results}"
+    assert len(already_resolved) == 4, f"the other four should see AlreadyResolved, got: {results}"
+
+    conn = db.init_db(db_path)
+    row = db.get_escalation(conn, "act-race-1")
+    assert row["status"] == "approved"
+    assert row["resolved_by"] == successes[0][0]
 
 
 def test_kill_restart_resolve_subprocess(tmp_path):

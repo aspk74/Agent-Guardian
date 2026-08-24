@@ -54,12 +54,19 @@ def resolve(conn, action_id: str, *, approved: bool, by: str) -> Decision:
     """Re-verifies payload_hash against the ORIGINAL parked envelope before
     returning an executable Decision -- this is the TOCTOU guard (PLAN.md
     finding 5 / rev-2): a human approves what was actually proposed, not
-    whatever the action looks like now."""
+    whatever the action looks like now.
+
+    The pending-status check and the resolving write must be a single
+    atomic operation, not a separate read then a separate write: two
+    concurrent callers racing on the same action_id could otherwise both
+    read status='pending' before either writes, both pass this check, and
+    both return an executable ALLOW Decision -- each falsely believing
+    their own call is what resolved it. db.resolve_escalation()'s UPDATE
+    carries the status='pending' guard in its WHERE clause and reports
+    whether THIS call actually won the race via its return value."""
     row = db.get_escalation(conn, action_id)
     if row is None:
         raise UnknownEscalation(action_id)
-    if row["status"] != "pending":
-        raise AlreadyResolved(f"{action_id} already {row['status']}")
 
     envelope = ActionEnvelope.model_validate_json(row["envelope_json"])
     stored_decision = Decision.model_validate_json(row["decision_json"])
@@ -68,12 +75,14 @@ def resolve(conn, action_id: str, *, approved: bool, by: str) -> Decision:
         raise ValueError(f"payload hash mismatch for {action_id}: escalation record is inconsistent")
 
     resolved_at = datetime.now(timezone.utc).isoformat()
-    db.resolve_escalation(
+    won_race = db.resolve_escalation(
         conn, action_id,
         status="approved" if approved else "rejected",
         resolved_by=by,
         resolved_at=resolved_at,
     )
+    if not won_race:
+        raise AlreadyResolved(f"{action_id} was resolved by a concurrent caller")
 
     final_status = DecisionStatus.ALLOW if approved else DecisionStatus.DENY
     return Decision(

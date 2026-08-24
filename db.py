@@ -353,13 +353,21 @@ def resolve_escalation(
     status: str,
     resolved_by: str,
     resolved_at: str,
-) -> None:
-    conn.execute(
+) -> bool:
+    """Atomically transitions a pending escalation to resolved. The
+    WHERE clause's status='pending' guard (not a separate read-then-write)
+    is what makes this safe under concurrent resolvers: two callers racing
+    on the same action_id can both pass an earlier SELECT-based pending
+    check, but only one UPDATE can ever match this WHERE clause, since
+    SQLite serializes writes. Returns True if this call was the one that
+    resolved it, False if another resolver won the race first."""
+    cursor = conn.execute(
         """
         UPDATE escalations
         SET status = ?, resolved_by = ?, resolved_at = ?
-        WHERE action_id = ?
+        WHERE action_id = ? AND status = 'pending'
         """,
         (status, resolved_by, resolved_at, action_id),
     )
     conn.commit()
+    return cursor.rowcount == 1
