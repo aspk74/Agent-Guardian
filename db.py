@@ -198,6 +198,131 @@ def insert_escalation(
     conn.commit()
 
 
+def get_actions_for_session(conn: sqlite3.Connection, session_id: str) -> list[sqlite3.Row]:
+    """Raw rows, chronological. Used by the Reporter (guardian/auditor.py) to
+    build the audit trail; reconstruction into Action/ActionEnvelope happens
+    there, not here, since the report also wants the plain row fields (e.g.
+    reasoning) without re-parsing params twice."""
+    return conn.execute(
+        "SELECT * FROM actions WHERE session_id = ? ORDER BY created_at",
+        (session_id,),
+    ).fetchall()
+
+
+def get_decisions_for_session(conn: sqlite3.Connection, session_id: str) -> list[Decision]:
+    """Decisions join to actions on action_id -- decisions carry no
+    session_id column of their own (see _SCHEMA above)."""
+    rows = conn.execute(
+        """
+        SELECT decisions.*
+        FROM decisions
+        JOIN actions ON actions.id = decisions.action_id
+        WHERE actions.session_id = ?
+        ORDER BY decisions.decided_at
+        """,
+        (session_id,),
+    ).fetchall()
+    return [
+        Decision(
+            action_id=row["action_id"],
+            status=DecisionStatus(row["status"]),
+            matched_rules=json.loads(row["matched_rules_json"]),
+            rule_id=row["rule_id"],
+            policy_version=row["policy_version"],
+            reasoning=row["reasoning"],
+            decided_by=row["decided_by"],
+            payload_hash=row["payload_hash"],
+            decided_at=row["decided_at"],
+        )
+        for row in rows
+    ]
+
+
+def get_outcomes_for_session(conn: sqlite3.Connection, session_id: str) -> list[Outcome]:
+    """Outcomes join to actions on action_id, same reasoning as decisions above."""
+    rows = conn.execute(
+        """
+        SELECT outcomes.*
+        FROM outcomes
+        JOIN actions ON actions.id = outcomes.action_id
+        WHERE actions.session_id = ?
+        ORDER BY outcomes.executed_at
+        """,
+        (session_id,),
+    ).fetchall()
+    return [
+        Outcome(
+            action_id=row["action_id"],
+            requesting_agent=row["requesting_agent"],
+            action_type=ActionType(row["action_type"]),
+            status=row["status"],
+            detail=row["detail"],
+            executed_at=row["executed_at"],
+        )
+        for row in rows
+    ]
+
+
+def get_escalations_for_session(conn: sqlite3.Connection, session_id: str) -> list[sqlite3.Row]:
+    """Escalations DO carry session_id directly (unlike decisions/outcomes),
+    so this is a plain filter, not a join."""
+    return conn.execute(
+        "SELECT * FROM escalations WHERE session_id = ? ORDER BY created_at",
+        (session_id,),
+    ).fetchall()
+
+
+def get_escalation_counts_by_agent(conn: sqlite3.Connection, since: str) -> list[sqlite3.Row]:
+    """Cross-session signal for the Reporter's informational pattern flags
+    (PLAN.md s6, s7 step 11) -- NOT used by policy_agent.py. Joins to actions
+    for requesting_agent since escalations itself doesn't carry the agent
+    name. Groups by agent across ALL sessions, which is the point: a single
+    session's report can flag an agent that's been escalated repeatedly
+    elsewhere."""
+    return conn.execute(
+        """
+        SELECT actions.requesting_agent AS agent,
+               COUNT(*) AS escalation_count,
+               COUNT(DISTINCT escalations.session_id) AS session_count
+        FROM escalations
+        JOIN actions ON actions.id = escalations.action_id
+        WHERE escalations.created_at >= ?
+        GROUP BY actions.requesting_agent
+        ORDER BY escalation_count DESC
+        """,
+        (since,),
+    ).fetchall()
+
+
+def get_payment_totals_by_agent(conn: sqlite3.Connection, since: str) -> list[sqlite3.Row]:
+    """Cross-session executed-payment volume per agent, for the same
+    informational report flags. Executed outcomes only, matching the
+    'denied attempts never count' rule elsewhere in this file (PLAN A4) --
+    though here it's for display, not enforcement."""
+    rows = conn.execute(
+        """
+        SELECT outcomes.requesting_agent AS agent,
+               actions.params_json AS params_json
+        FROM outcomes
+        JOIN actions ON actions.id = outcomes.action_id
+        WHERE outcomes.action_type = ?
+          AND outcomes.status = 'success'
+          AND outcomes.executed_at >= ?
+        """,
+        (ActionType.MAKE_PAYMENT.value, since),
+    ).fetchall()
+    totals: dict[str, int] = {}
+    for row in rows:
+        params = json.loads(row["params_json"])
+        totals[row["agent"]] = totals.get(row["agent"], 0) + params.get("amount_cents", 0)
+    # Plain dicts, not sqlite3.Row -- these are aggregated in Python, not by
+    # the query, so there's no underlying cursor row to wrap.
+    return [
+        {"agent": agent, "total_cents": cents}
+        for agent, cents in sorted(totals.items(), key=lambda kv: -kv[1])
+    ]
+
+
 def get_escalation(conn: sqlite3.Connection, action_id: str) -> sqlite3.Row | None:
     return conn.execute(
         "SELECT * FROM escalations WHERE action_id = ?", (action_id,)
