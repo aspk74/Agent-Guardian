@@ -106,6 +106,19 @@ def test_fin_004_known_counterparty_allowed():
     assert predicates.rule_matches(_payment(100, target="shadowco"), HISTORY, rule) is False
 
 
+def test_target_in_and_not_in_are_case_insensitive():
+    """Regression: caught by a live demo run where the LLM phrased a known
+    counterparty as "Globex" / "ShadowCo" -- policy.yaml lists lowercase
+    "globex", and exact-string matching treated a known counterparty as
+    unknown (FIN-003 fired) and denied a legitimately-known one under
+    FIN-004. Counterparty identity shouldn't hinge on casing the model
+    never promised to normalize."""
+    fin_003, fin_004 = _rule("FIN-003"), _rule("FIN-004")
+    assert predicates.rule_matches(_payment(100, target="Globex"), HISTORY, fin_003) is False
+    assert predicates.rule_matches(_payment(100, target="Globex"), HISTORY, fin_004) is True
+    assert predicates.rule_matches(_payment(100, target="SHADOWCO"), HISTORY, fin_003) is True
+
+
 def test_file_001_prod_delete_denied():
     rule = _rule("FILE-001")
     assert predicates.rule_matches(_file(ActionType.DELETE_FILE, "config.prod.yaml"), HISTORY, rule) is True
@@ -122,3 +135,8 @@ def test_mail_001_external_recipient_escalated():
     rule = _rule("MAIL-001")
     assert predicates.rule_matches(_email("vendor@external.com"), HISTORY, rule) is True
     assert predicates.rule_matches(_email("alice@internal.example.com"), HISTORY, rule) is False
+
+
+def test_mail_001_domain_check_is_case_insensitive():
+    rule = _rule("MAIL-001")
+    assert predicates.rule_matches(_email("Alice@Internal.Example.COM"), HISTORY, rule) is False

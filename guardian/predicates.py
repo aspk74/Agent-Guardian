@@ -56,11 +56,16 @@ def rule_matches(action: Action, history: "HistoryQuery", rule: dict) -> bool:
             return False
 
     if "target_not_in" in when:
-        if action.target in when["target_not_in"]:
+        # Case-insensitive: target is an honest echo of whatever the LLM
+        # phrased (e.g. "Globex" vs policy.yaml's "globex"), and counterparty
+        # identity shouldn't hinge on capitalization the model didn't
+        # promise to preserve consistently. Caught by the live demo run --
+        # a known counterparty was denied as unknown under FIN-003.
+        if action.target.casefold() in {v.casefold() for v in when["target_not_in"]}:
             return False
 
     if "target_in" in when:
-        if action.target not in when["target_in"]:
+        if action.target.casefold() not in {v.casefold() for v in when["target_in"]}:
             return False
 
     if "target_glob" in when:
@@ -72,7 +77,7 @@ def rule_matches(action: Action, history: "HistoryQuery", rule: dict) -> bool:
         # means split-with-no-separator just returns the whole string via
         # [-1] -- that's fine, it'll fail the "not in" check normally.
         domain = action.target.split("@")[-1]
-        if domain in when["target_domain_not_in"]:
+        if domain.casefold() in {v.casefold() for v in when["target_domain_not_in"]}:
             return False
 
     return True
