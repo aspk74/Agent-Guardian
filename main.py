@@ -27,6 +27,7 @@ import db
 import guardian.auditor as auditor
 import guardian.coverage_check as coverage_check
 import guardian.escalation as esc
+import guardian.executors as executors
 import guardian.graph as graph
 import guardian.policy_agent as policy_agent
 from agents.finance_agent import FinanceAgent
@@ -116,12 +117,23 @@ def cmd_run(name: str, session_id: str, *, db_path: str, by: str) -> None:
         worker = workers[agent_name]
 
         envelope = worker.handle(task, session_id=session_id)
-        result = graph.run_once(conn, envelope)
-        decision = result["decision"]
-
         print(f"\n[{agent_name}] task: {task!r}")
         print(f"  action: {envelope.action.action_type.value} -> {envelope.action.target}")
         print(f"  reasoning (LLM, audit-only): {envelope.reasoning!r}")
+
+        try:
+            result = graph.run_once(conn, envelope)
+        except executors.ExecutionFailed as exc:
+            # record_proposal/evaluate_policy/record_decision already ran
+            # and committed inside the graph before execute() raised: the
+            # action was allowed and that's durably recorded, only
+            # execution itself failed. Not lost -- `main.py resolve` retries
+            # it (see cmd_resolve's auto-allow retry pass below).
+            print("  decision: allow (auto-approved by policy)")
+            print(f"  outcome: none (approved, but execution failed -- {exc}; "
+                  f"retry with `main.py resolve`)", file=sys.stderr)
+            continue
+        decision = result["decision"]
         print(f"  decision: {decision.status.value} (rule_id={decision.rule_id}, "
               f"matched={decision.matched_rules})")
 
@@ -138,6 +150,12 @@ def cmd_run(name: str, session_id: str, *, db_path: str, by: str) -> None:
                 # only a concurrent resolver could have already resolved it
                 # -- report and move on rather than crash the whole scenario.
                 print("  outcome: none (resolved by another process while awaiting this prompt)")
+                continue
+            except esc.ExecutionFailed as exc:
+                # Approval is already committed -- this is not lost, just
+                # not done yet. `main.py resolve` retries it (see cmd_resolve).
+                print(f"  outcome: none (approved, but execution failed -- {exc}; "
+                      f"retry with `main.py resolve`)", file=sys.stderr)
                 continue
             if outcome is None:
                 print("  outcome: none (rejected by human, never executed)")
@@ -191,40 +209,79 @@ def cmd_report(session_id: str, db_path: str) -> None:
 def cmd_resolve(*, db_path: str, session_id: str | None, by: str) -> None:
     """Recovery path: prompts for every escalation still status='pending' in
     the db, regardless of which process (or which now-dead process) parked
-    it. This is the proof that escalation state survives a kill -- see
-    tests/test_escalation_resume.py."""
+    it, THEN retries every action whose execution previously failed after
+    being allowed -- both the escalated-then-approved case (esc.unexecuted())
+    and the auto-allowed case (graph.unexecuted_allows()), which fails the
+    same way but leaves no escalations row at all. All three are
+    "unfinished business" this command exists to resume; see
+    tests/test_escalation_resume.py, tests/test_execution_recovery.py, and
+    tests/test_auto_allow_execution_recovery.py respectively."""
     conn = db.init_db(db_path)
     rows = esc.pending(conn, session_id=session_id)
-    if not rows:
-        print(f"no pending escalations in {db_path}"
+    stuck = esc.unexecuted(conn, session_id=session_id)
+    stuck_allows = graph.unexecuted_allows(conn, session_id=session_id)
+
+    if not rows and not stuck and not stuck_allows:
+        print(f"no pending escalations or stuck actions in {db_path}"
               + (f" for session {session_id}" if session_id else ""))
         return
 
-    print(f"{len(rows)} pending escalation(s) in {db_path}")
-    for row in rows:
-        envelope, decision = row["envelope"], row["decision"]
-        try:
-            approved = _prompt_approval(envelope, decision)
-        except NonInteractiveApproval as exc:
-            # stdin is gone -- every remaining row would hit the same EOF,
-            # so stop the batch here rather than loop into more failures.
-            print(f"  stopped: {exc}", file=sys.stderr)
-            sys.exit(1)
-        try:
-            outcome = esc.resolve_and_execute(conn, envelope.action.id, approved=approved, by=by)
-        except (esc.AlreadyResolved, ValueError) as exc:
-            # Rows are a snapshot from esc.pending() taken before this loop
-            # started prompting; a concurrent resolver may have already
-            # resolved this exact row (AlreadyResolved), or -- far less
-            # likely -- its stored payload_hash no longer matches (ValueError,
-            # an inconsistent escalation record). Either way this ONE row's
-            # problem must not abandon every row still waiting behind it.
-            print(f"  skipped: {exc}")
-            continue
-        if outcome is None:
-            print("  outcome: none (rejected by human, never executed)")
-        else:
-            print(f"  outcome: {outcome.status} -- {outcome.detail}")
+    if rows:
+        print(f"{len(rows)} pending escalation(s) in {db_path}")
+        for row in rows:
+            envelope, decision = row["envelope"], row["decision"]
+            try:
+                approved = _prompt_approval(envelope, decision)
+            except NonInteractiveApproval as exc:
+                # stdin is gone -- every remaining row would hit the same EOF,
+                # so stop the batch here rather than loop into more failures.
+                print(f"  stopped: {exc}", file=sys.stderr)
+                sys.exit(1)
+            try:
+                outcome = esc.resolve_and_execute(conn, envelope.action.id, approved=approved, by=by)
+            except (esc.AlreadyResolved, ValueError) as exc:
+                # Rows are a snapshot from esc.pending() taken before this loop
+                # started prompting; a concurrent resolver may have already
+                # resolved this exact row (AlreadyResolved), or -- far less
+                # likely -- its stored payload_hash no longer matches (ValueError,
+                # an inconsistent escalation record). Either way this ONE row's
+                # problem must not abandon every row still waiting behind it.
+                print(f"  skipped: {exc}")
+                continue
+            except esc.ExecutionFailed as exc:
+                # Approved just now, but execution itself failed -- it'll show
+                # up in esc.unexecuted() and get retried below on a future run
+                # of this same command.
+                print(f"  outcome: none (approved, but execution failed -- {exc})")
+                continue
+            if outcome is None:
+                print("  outcome: none (rejected by human, never executed)")
+            else:
+                print(f"  outcome: {outcome.status} -- {outcome.detail}")
+
+    if stuck:
+        print(f"\n{len(stuck)} approved action(s) previously failed to execute -- retrying")
+        for row in stuck:
+            action_id = row["envelope"].action.id
+            try:
+                outcome = esc.execute_approved(conn, action_id)
+            except esc.ExecutionFailed as exc:
+                # Same problem again (e.g. the downstream API is still down)
+                # -- report and move to the next stuck row rather than abort.
+                print(f"  {action_id}: still failing -- {exc}")
+                continue
+            print(f"  {action_id}: outcome: {outcome.status} -- {outcome.detail}")
+
+    if stuck_allows:
+        print(f"\n{len(stuck_allows)} auto-allowed action(s) previously failed to execute -- retrying")
+        for row in stuck_allows:
+            action_id = row["action"].id
+            try:
+                outcome = graph.retry_execution(conn, action_id)
+            except executors.ExecutionFailed as exc:
+                print(f"  {action_id}: still failing -- {exc}")
+                continue
+            print(f"  {action_id}: outcome: {outcome.status} -- {outcome.detail}")
 
 
 if __name__ == "__main__":

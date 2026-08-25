@@ -157,6 +157,59 @@ def get_outcome(conn: sqlite3.Connection, action_id: str) -> Outcome | None:
     )
 
 
+def get_action(conn: sqlite3.Connection, action_id: str) -> Action | None:
+    """Reconstructs the full typed Action (params included) from the actions
+    table. params discriminates on its embedded "kind" field (schemas.py's
+    Field(discriminator="kind")), so this works for any action_type without
+    a per-type branch -- unlike guardian/auditor.py's report(), which only
+    ever needs PaymentParams for one report line and hardcodes that."""
+    row = conn.execute("SELECT * FROM actions WHERE id = ?", (action_id,)).fetchone()
+    if row is None:
+        return None
+    return Action(
+        id=row["id"],
+        session_id=row["session_id"],
+        requesting_agent=row["requesting_agent"],
+        action_type=ActionType(row["action_type"]),
+        target=row["target"],
+        params=json.loads(row["params_json"]),
+        created_at=row["created_at"],
+    )
+
+
+def get_unexecuted_allows(
+    conn: sqlite3.Connection, session_id: str | None = None
+) -> list[sqlite3.Row]:
+    """Auto-allowed actions (decisions.status='allow') with no matching
+    outcome -- the executor raised inside guardian/graph.py's execute node,
+    for a non-escalated action. Distinct from get_unexecuted_approvals()
+    above (the escalated-then-human-approved case, tracked in the
+    escalations table): resolve()'s final human decision is never written
+    to the decisions table (only to escalations.status/resolved_by/at), so
+    an 'allow' row here can only ever come from a direct
+    policy_agent.evaluate() decision -- the two queries never overlap."""
+    if session_id is None:
+        return conn.execute(
+            """
+            SELECT decisions.* FROM decisions
+            LEFT JOIN outcomes ON outcomes.action_id = decisions.action_id
+            WHERE decisions.status = 'allow' AND outcomes.action_id IS NULL
+            ORDER BY decisions.decided_at
+            """
+        ).fetchall()
+    return conn.execute(
+        """
+        SELECT decisions.* FROM decisions
+        JOIN actions ON actions.id = decisions.action_id
+        LEFT JOIN outcomes ON outcomes.action_id = decisions.action_id
+        WHERE decisions.status = 'allow' AND outcomes.action_id IS NULL
+          AND actions.session_id = ?
+        ORDER BY decisions.decided_at
+        """,
+        (session_id,),
+    ).fetchall()
+
+
 def get_decision(conn: sqlite3.Connection, action_id: str) -> Decision | None:
     row = conn.execute(
         "SELECT * FROM decisions WHERE action_id = ?", (action_id,)
@@ -341,6 +394,35 @@ def get_pending_escalations(
         SELECT * FROM escalations
         WHERE status = 'pending' AND session_id = ?
         ORDER BY created_at
+        """,
+        (session_id,),
+    ).fetchall()
+
+
+def get_unexecuted_approvals(
+    conn: sqlite3.Connection, session_id: str | None = None
+) -> list[sqlite3.Row]:
+    """Escalations approved by a human but with no matching outcomes row --
+    the executor raised after approval was already committed (see
+    guardian/escalation.py's ExecutionFailed). LEFT JOIN against outcomes
+    (whose action_id is a PRIMARY KEY) rather than a NOT IN subquery, so this
+    stays a straightforward indexed join, not a subquery scan."""
+    if session_id is None:
+        return conn.execute(
+            """
+            SELECT escalations.* FROM escalations
+            LEFT JOIN outcomes ON outcomes.action_id = escalations.action_id
+            WHERE escalations.status = 'approved' AND outcomes.action_id IS NULL
+            ORDER BY escalations.created_at
+            """
+        ).fetchall()
+    return conn.execute(
+        """
+        SELECT escalations.* FROM escalations
+        LEFT JOIN outcomes ON outcomes.action_id = escalations.action_id
+        WHERE escalations.status = 'approved' AND outcomes.action_id IS NULL
+          AND escalations.session_id = ?
+        ORDER BY escalations.created_at
         """,
         (session_id,),
     ).fetchall()

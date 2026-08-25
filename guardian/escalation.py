@@ -10,6 +10,10 @@ from datetime import datetime, timezone
 import db
 import guardian.auditor as auditor
 import guardian.executors as executors
+from guardian.executors import ExecutionFailed  # re-exported: callers here
+                                                  # catch esc.ExecutionFailed,
+                                                  # same class executors.run()
+                                                  # itself now raises.
 from schemas import ActionEnvelope, Decision, DecisionStatus, Outcome
 
 
@@ -19,6 +23,11 @@ class UnknownEscalation(Exception):
 
 class AlreadyResolved(Exception):
     """resolve() called twice on the same action_id."""
+
+
+class NotApproved(Exception):
+    """execute_approved() called on an action_id that isn't status='approved'
+    (still pending, or was rejected -- neither has anything to execute)."""
 
 
 def park(conn, envelope: ActionEnvelope, decision: Decision) -> None:
@@ -104,7 +113,14 @@ def resolve_and_execute(conn, action_id: str, *, approved: bool, by: str) -> Out
     """Shared by main.py's CLI and dashboard.py's HTTP routes (PLAN.md s5:
     "Phase 2 CLI and Phase 3 HTTP call the same three functions") -- this is
     the fourth: resolve() plus, if approved, running the executor. Returns
-    None for a rejected/denied resolution (nothing executes)."""
+    None for a rejected/denied resolution (nothing executes).
+
+    approval is durably committed by resolve() above BEFORE the executor
+    ever runs, so a failure here does not undo it -- executors.run() itself
+    raises ExecutionFailed if the executor's own body raises (see
+    guardian/executors.py); its other three guard exceptions
+    (NotAuthorized, PayloadMismatchError, ExecutorMissing) propagate
+    unwrapped, same as always."""
     decision = resolve(conn, action_id, approved=approved, by=by)
     if decision.status is not DecisionStatus.ALLOW:
         return None
@@ -115,3 +131,65 @@ def resolve_and_execute(conn, action_id: str, *, approved: bool, by: str) -> Out
         outcome_lookup=lambda aid: auditor.outcome_for(conn, aid),
         outcome_record=lambda o: auditor.record_outcome(conn, o),
     )
+
+
+def _approved_decision(row) -> Decision:
+    """Reconstructs the executable ALLOW Decision for a row already in
+    status='approved', from the escalate-time Decision stored at park() plus
+    the resolution metadata db.resolve_escalation() recorded (resolved_by).
+    Used by execute_approved() and unexecuted() to retry/display execution
+    against an already-approved row without re-running resolve() (which
+    requires status='pending' and would raise AlreadyResolved here)."""
+    stored_decision = Decision.model_validate_json(row["decision_json"])
+    envelope = ActionEnvelope.model_validate_json(row["envelope_json"])
+    return Decision(
+        action_id=row["action_id"],
+        status=DecisionStatus.ALLOW,
+        matched_rules=stored_decision.matched_rules,
+        rule_id=stored_decision.rule_id,
+        policy_version=stored_decision.policy_version,
+        reasoning=f"human approved by {row['resolved_by']} (was: {stored_decision.reasoning})",
+        decided_by="human",
+        payload_hash=envelope.action.payload_hash(),
+    )
+
+
+def execute_approved(conn, action_id: str) -> Outcome:
+    """Retries execution for an action already approved (status='approved')
+    whose prior attempt raised ExecutionFailed. Does NOT require
+    status='pending' and never touches escalation status -- it only
+    re-invokes executors.run(), whose outcome_lookup guard already makes
+    this safe to call repeatedly (a call after a successful retry just
+    returns the recorded Outcome again, no double-execution).
+
+    Raises NotApproved if the row isn't status='approved' (still pending, or
+    was rejected) and UnknownEscalation if action_id was never parked."""
+    row = db.get_escalation(conn, action_id)
+    if row is None:
+        raise UnknownEscalation(action_id)
+    if row["status"] != "approved":
+        raise NotApproved(f"{action_id} is {row['status']}, not approved")
+
+    decision = _approved_decision(row)
+    envelope = ActionEnvelope.model_validate_json(row["envelope_json"])
+    return executors.run(
+        envelope.action, decision,
+        outcome_lookup=lambda aid: auditor.outcome_for(conn, aid),
+        outcome_record=lambda o: auditor.record_outcome(conn, o),
+    )
+
+
+def unexecuted(conn, session_id: str | None = None) -> list[dict]:
+    """Approved escalations with no recorded Outcome -- stuck by a prior
+    ExecutionFailed. Same dict shape as pending() (plus resolved_by/at) for
+    CLI/dashboard reuse."""
+    rows = db.get_unexecuted_approvals(conn, session_id=session_id)
+    return [
+        {
+            "envelope": ActionEnvelope.model_validate_json(row["envelope_json"]),
+            "decision": _approved_decision(row),
+            "resolved_by": row["resolved_by"],
+            "resolved_at": row["resolved_at"],
+        }
+        for row in rows
+    ]
