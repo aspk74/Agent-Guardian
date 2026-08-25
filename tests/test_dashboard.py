@@ -12,9 +12,13 @@ import sqlite3
 from fastapi.testclient import TestClient
 
 import db
+import guardian.auditor as auditor
 import guardian.escalation as esc
+import guardian.executors as executors
 import dashboard
-from schemas import Action, ActionEnvelope, Decision, DecisionStatus, PaymentParams
+from schemas import (
+    Action, ActionEnvelope, ActionType, Decision, DecisionStatus, FileParams, PaymentParams,
+)
 
 
 def make_escalated_envelope_and_decision(action_id: str, policy_version: str = "testver"):
@@ -167,4 +171,89 @@ def test_resolve_via_api_unknown_action_returns_404_not_500(tmp_path, monkeypatc
 
     client = TestClient(dashboard.app)
     resp = client.post("/api/resolve/no-such-action", params={"approved": True, "by": "operator-1"})
+    assert resp.status_code == 404
+
+
+def make_allowed_envelope_and_decision(action_id: str):
+    action = Action(
+        id=action_id, session_id="dash-allow-sess", requesting_agent="file-read",
+        action_type="read_file", target="workspace/report.md",
+        params=FileParams(path="workspace/report.md"),
+    )
+    envelope = ActionEnvelope(action=action, reasoning="r", model="t", raw_response="{}")
+    decision = Decision(
+        action_id=action_id, status=DecisionStatus.ALLOW, matched_rules=["FILE-002"],
+        rule_id="FILE-002", policy_version="v", reasoning="reads inside the workspace are routine",
+        decided_by="policy", payload_hash=action.payload_hash(),
+    )
+    return envelope, decision
+
+
+def test_resolve_via_api_wraps_execution_failure_as_502_not_500(tmp_path, monkeypatch):
+    """Regression companion to test_resolve_via_api_twice_returns_409_not_500:
+    an executor raising after approval must surface as a clean 502
+    (guardian.escalation.ExecutionFailed), not an unhandled 500 -- the
+    escalation itself is fine, a downstream dependency isn't."""
+    conn, _, _ = _setup(tmp_path, monkeypatch)
+    envelope, decision = make_escalated_envelope_and_decision("act-dash-7")
+    esc.park(conn, envelope, decision)
+
+    def _raise(_action):
+        raise RuntimeError("simulated Stripe outage")
+    monkeypatch.setitem(executors.EXECUTORS, ActionType.MAKE_PAYMENT, _raise)
+
+    client = TestClient(dashboard.app)
+    resp = client.post("/api/resolve/act-dash-7", params={"approved": True, "by": "operator-1"})
+    assert resp.status_code == 502
+    assert "act-dash-7" in resp.json()["detail"]
+
+    # Approval already committed -- confirmed via the stuck-approvals JSON.
+    stuck = client.get("/stuck").json()
+    assert len(stuck) == 1
+    assert stuck[0]["action_id"] == "act-dash-7"
+
+
+def test_stuck_allows_json_and_retry_via_api(tmp_path, monkeypatch):
+    """Auto-allowed (never escalated) action whose execution previously
+    failed: /stuck-allows lists it, /api/retry/{id} retries it through
+    guardian.graph.retry_execution() -- the SAME recovery guardian/graph.py
+    unit tests exercise directly, proven here at the HTTP layer."""
+    conn, _, _ = _setup(tmp_path, monkeypatch)
+    envelope, decision = make_allowed_envelope_and_decision("act-dash-allow-1")
+    auditor.record_envelope(conn, envelope)
+    auditor.record_decision(conn, decision)
+    # No outcome recorded -- simulates a prior ExecutionFailed without
+    # needing to actually break/restore the executor for this HTTP-level test.
+
+    client = TestClient(dashboard.app)
+    stuck = client.get("/stuck-allows").json()
+    assert len(stuck) == 1
+    assert stuck[0]["action_id"] == "act-dash-allow-1"
+    assert stuck[0]["rule_id"] == "FILE-002"
+
+    resp = client.post("/api/retry/act-dash-allow-1")
+    assert resp.status_code == 200
+    assert resp.json()["outcome"]["status"] == "success"
+
+    assert client.get("/stuck-allows").json() == []
+
+
+def test_dashboard_page_renders_stuck_allow_row(tmp_path, monkeypatch):
+    conn, _, _ = _setup(tmp_path, monkeypatch)
+    envelope, decision = make_allowed_envelope_and_decision("act-dash-allow-2")
+    auditor.record_envelope(conn, envelope)
+    auditor.record_decision(conn, decision)
+
+    client = TestClient(dashboard.app)
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert "act-dash-allow-2" in resp.text
+    assert "Auto-allowed but not yet executed" in resp.text
+
+
+def test_retry_via_api_unknown_action_returns_404_not_500(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+
+    client = TestClient(dashboard.app)
+    resp = client.post("/api/retry/no-such-action")
     assert resp.status_code == 404

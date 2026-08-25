@@ -24,6 +24,25 @@ class ExecutorMissing(Exception):
     that EXECUTORS never learned about."""
 
 
+class ExecutionFailed(Exception):
+    """The executor itself raised while performing the action (e.g. a real
+    Stripe/SMTP call failing) -- distinct from this module's other three
+    exceptions above, which are run()'s own pre-flight guards (tamper/config
+    signals that a retry can't fix, so they're raised directly, never
+    wrapped here). By the time this fires, decision.status was already
+    ALLOW and this action's Decision is already durably recorded by the
+    caller (guardian/escalation.py's resolve(), or guardian/graph.py's
+    record_decision node) -- nothing is lost. Calling run() again once the
+    underlying problem is resolved is the correct retry: outcome_lookup's
+    idempotency guard (below) makes that safe even if the first attempt
+    partially succeeded before raising. Wraps the original exception as
+    __cause__."""
+
+    def __init__(self, action_id: str, original: BaseException):
+        super().__init__(f"action {action_id} execution failed: {original}")
+        self.action_id = action_id
+
+
 def _simulate_payment(action: Action) -> Outcome:
     p = action.params
     detail = f"paid {p.counterparty} ${p.amount_cents / 100:.2f} (simulated)"
@@ -86,6 +105,9 @@ def run(action: Action, decision: Decision, *, outcome_lookup, outcome_record) -
     except KeyError:
         raise ExecutorMissing(f"no executor registered for {action.action_type}") from None
 
-    outcome = fn(action)
+    try:
+        outcome = fn(action)
+    except Exception as exc:
+        raise ExecutionFailed(action.id, exc) from exc
     outcome_record(outcome)
     return outcome

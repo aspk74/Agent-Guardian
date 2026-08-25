@@ -27,6 +27,7 @@ import db
 import guardian.auditor as auditor
 import guardian.coverage_check as coverage_check
 import guardian.escalation as esc
+import guardian.executors as executors
 import guardian.graph as graph
 import guardian.policy_agent as policy_agent
 from agents.finance_agent import FinanceAgent
@@ -116,12 +117,23 @@ def cmd_run(name: str, session_id: str, *, db_path: str, by: str) -> None:
         worker = workers[agent_name]
 
         envelope = worker.handle(task, session_id=session_id)
-        result = graph.run_once(conn, envelope)
-        decision = result["decision"]
-
         print(f"\n[{agent_name}] task: {task!r}")
         print(f"  action: {envelope.action.action_type.value} -> {envelope.action.target}")
         print(f"  reasoning (LLM, audit-only): {envelope.reasoning!r}")
+
+        try:
+            result = graph.run_once(conn, envelope)
+        except executors.ExecutionFailed as exc:
+            # record_proposal/evaluate_policy/record_decision already ran
+            # and committed inside the graph before execute() raised: the
+            # action was allowed and that's durably recorded, only
+            # execution itself failed. Not lost -- `main.py resolve` retries
+            # it (see cmd_resolve's auto-allow retry pass below).
+            print("  decision: allow (auto-approved by policy)")
+            print(f"  outcome: none (approved, but execution failed -- {exc}; "
+                  f"retry with `main.py resolve`)", file=sys.stderr)
+            continue
+        decision = result["decision"]
         print(f"  decision: {decision.status.value} (rule_id={decision.rule_id}, "
               f"matched={decision.matched_rules})")
 
@@ -197,17 +209,20 @@ def cmd_report(session_id: str, db_path: str) -> None:
 def cmd_resolve(*, db_path: str, session_id: str | None, by: str) -> None:
     """Recovery path: prompts for every escalation still status='pending' in
     the db, regardless of which process (or which now-dead process) parked
-    it, THEN retries every approved escalation that was previously committed
-    but never executed (esc.ExecutionFailed -- the executor raised after
-    approval, e.g. a downstream API outage). Both are "unfinished business"
-    this command exists to resume; see tests/test_escalation_resume.py for
-    the pending case and tests/test_execution_recovery.py for the stuck one."""
+    it, THEN retries every action whose execution previously failed after
+    being allowed -- both the escalated-then-approved case (esc.unexecuted())
+    and the auto-allowed case (graph.unexecuted_allows()), which fails the
+    same way but leaves no escalations row at all. All three are
+    "unfinished business" this command exists to resume; see
+    tests/test_escalation_resume.py, tests/test_execution_recovery.py, and
+    tests/test_auto_allow_execution_recovery.py respectively."""
     conn = db.init_db(db_path)
     rows = esc.pending(conn, session_id=session_id)
     stuck = esc.unexecuted(conn, session_id=session_id)
+    stuck_allows = graph.unexecuted_allows(conn, session_id=session_id)
 
-    if not rows and not stuck:
-        print(f"no pending escalations or stuck approvals in {db_path}"
+    if not rows and not stuck and not stuck_allows:
+        print(f"no pending escalations or stuck actions in {db_path}"
               + (f" for session {session_id}" if session_id else ""))
         return
 
@@ -253,6 +268,17 @@ def cmd_resolve(*, db_path: str, session_id: str | None, by: str) -> None:
             except esc.ExecutionFailed as exc:
                 # Same problem again (e.g. the downstream API is still down)
                 # -- report and move to the next stuck row rather than abort.
+                print(f"  {action_id}: still failing -- {exc}")
+                continue
+            print(f"  {action_id}: outcome: {outcome.status} -- {outcome.detail}")
+
+    if stuck_allows:
+        print(f"\n{len(stuck_allows)} auto-allowed action(s) previously failed to execute -- retrying")
+        for row in stuck_allows:
+            action_id = row["action"].id
+            try:
+                outcome = graph.retry_execution(conn, action_id)
+            except executors.ExecutionFailed as exc:
                 print(f"  {action_id}: still failing -- {exc}")
                 continue
             print(f"  {action_id}: outcome: {outcome.status} -- {outcome.detail}")
