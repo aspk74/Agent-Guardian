@@ -346,6 +346,35 @@ def get_pending_escalations(
     ).fetchall()
 
 
+def get_unexecuted_approvals(
+    conn: sqlite3.Connection, session_id: str | None = None
+) -> list[sqlite3.Row]:
+    """Escalations approved by a human but with no matching outcomes row --
+    the executor raised after approval was already committed (see
+    guardian/escalation.py's ExecutionFailed). LEFT JOIN against outcomes
+    (whose action_id is a PRIMARY KEY) rather than a NOT IN subquery, so this
+    stays a straightforward indexed join, not a subquery scan."""
+    if session_id is None:
+        return conn.execute(
+            """
+            SELECT escalations.* FROM escalations
+            LEFT JOIN outcomes ON outcomes.action_id = escalations.action_id
+            WHERE escalations.status = 'approved' AND outcomes.action_id IS NULL
+            ORDER BY escalations.created_at
+            """
+        ).fetchall()
+    return conn.execute(
+        """
+        SELECT escalations.* FROM escalations
+        LEFT JOIN outcomes ON outcomes.action_id = escalations.action_id
+        WHERE escalations.status = 'approved' AND outcomes.action_id IS NULL
+          AND escalations.session_id = ?
+        ORDER BY escalations.created_at
+        """,
+        (session_id,),
+    ).fetchall()
+
+
 def resolve_escalation(
     conn: sqlite3.Connection,
     action_id: str,

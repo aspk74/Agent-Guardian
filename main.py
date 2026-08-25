@@ -139,6 +139,12 @@ def cmd_run(name: str, session_id: str, *, db_path: str, by: str) -> None:
                 # -- report and move on rather than crash the whole scenario.
                 print("  outcome: none (resolved by another process while awaiting this prompt)")
                 continue
+            except esc.ExecutionFailed as exc:
+                # Approval is already committed -- this is not lost, just
+                # not done yet. `main.py resolve` retries it (see cmd_resolve).
+                print(f"  outcome: none (approved, but execution failed -- {exc}; "
+                      f"retry with `main.py resolve`)", file=sys.stderr)
+                continue
             if outcome is None:
                 print("  outcome: none (rejected by human, never executed)")
             else:
@@ -191,40 +197,65 @@ def cmd_report(session_id: str, db_path: str) -> None:
 def cmd_resolve(*, db_path: str, session_id: str | None, by: str) -> None:
     """Recovery path: prompts for every escalation still status='pending' in
     the db, regardless of which process (or which now-dead process) parked
-    it. This is the proof that escalation state survives a kill -- see
-    tests/test_escalation_resume.py."""
+    it, THEN retries every approved escalation that was previously committed
+    but never executed (esc.ExecutionFailed -- the executor raised after
+    approval, e.g. a downstream API outage). Both are "unfinished business"
+    this command exists to resume; see tests/test_escalation_resume.py for
+    the pending case and tests/test_execution_recovery.py for the stuck one."""
     conn = db.init_db(db_path)
     rows = esc.pending(conn, session_id=session_id)
-    if not rows:
-        print(f"no pending escalations in {db_path}"
+    stuck = esc.unexecuted(conn, session_id=session_id)
+
+    if not rows and not stuck:
+        print(f"no pending escalations or stuck approvals in {db_path}"
               + (f" for session {session_id}" if session_id else ""))
         return
 
-    print(f"{len(rows)} pending escalation(s) in {db_path}")
-    for row in rows:
-        envelope, decision = row["envelope"], row["decision"]
-        try:
-            approved = _prompt_approval(envelope, decision)
-        except NonInteractiveApproval as exc:
-            # stdin is gone -- every remaining row would hit the same EOF,
-            # so stop the batch here rather than loop into more failures.
-            print(f"  stopped: {exc}", file=sys.stderr)
-            sys.exit(1)
-        try:
-            outcome = esc.resolve_and_execute(conn, envelope.action.id, approved=approved, by=by)
-        except (esc.AlreadyResolved, ValueError) as exc:
-            # Rows are a snapshot from esc.pending() taken before this loop
-            # started prompting; a concurrent resolver may have already
-            # resolved this exact row (AlreadyResolved), or -- far less
-            # likely -- its stored payload_hash no longer matches (ValueError,
-            # an inconsistent escalation record). Either way this ONE row's
-            # problem must not abandon every row still waiting behind it.
-            print(f"  skipped: {exc}")
-            continue
-        if outcome is None:
-            print("  outcome: none (rejected by human, never executed)")
-        else:
-            print(f"  outcome: {outcome.status} -- {outcome.detail}")
+    if rows:
+        print(f"{len(rows)} pending escalation(s) in {db_path}")
+        for row in rows:
+            envelope, decision = row["envelope"], row["decision"]
+            try:
+                approved = _prompt_approval(envelope, decision)
+            except NonInteractiveApproval as exc:
+                # stdin is gone -- every remaining row would hit the same EOF,
+                # so stop the batch here rather than loop into more failures.
+                print(f"  stopped: {exc}", file=sys.stderr)
+                sys.exit(1)
+            try:
+                outcome = esc.resolve_and_execute(conn, envelope.action.id, approved=approved, by=by)
+            except (esc.AlreadyResolved, ValueError) as exc:
+                # Rows are a snapshot from esc.pending() taken before this loop
+                # started prompting; a concurrent resolver may have already
+                # resolved this exact row (AlreadyResolved), or -- far less
+                # likely -- its stored payload_hash no longer matches (ValueError,
+                # an inconsistent escalation record). Either way this ONE row's
+                # problem must not abandon every row still waiting behind it.
+                print(f"  skipped: {exc}")
+                continue
+            except esc.ExecutionFailed as exc:
+                # Approved just now, but execution itself failed -- it'll show
+                # up in esc.unexecuted() and get retried below on a future run
+                # of this same command.
+                print(f"  outcome: none (approved, but execution failed -- {exc})")
+                continue
+            if outcome is None:
+                print("  outcome: none (rejected by human, never executed)")
+            else:
+                print(f"  outcome: {outcome.status} -- {outcome.detail}")
+
+    if stuck:
+        print(f"\n{len(stuck)} approved action(s) previously failed to execute -- retrying")
+        for row in stuck:
+            action_id = row["envelope"].action.id
+            try:
+                outcome = esc.execute_approved(conn, action_id)
+            except esc.ExecutionFailed as exc:
+                # Same problem again (e.g. the downstream API is still down)
+                # -- report and move to the next stuck row rather than abort.
+                print(f"  {action_id}: still failing -- {exc}")
+                continue
+            print(f"  {action_id}: outcome: {outcome.status} -- {outcome.detail}")
 
 
 if __name__ == "__main__":

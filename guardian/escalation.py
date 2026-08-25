@@ -21,6 +21,25 @@ class AlreadyResolved(Exception):
     """resolve() called twice on the same action_id."""
 
 
+class NotApproved(Exception):
+    """execute_approved() called on an action_id that isn't status='approved'
+    (still pending, or was rejected -- neither has anything to execute)."""
+
+
+class ExecutionFailed(Exception):
+    """Approval succeeded and was already durably committed (status='approved'
+    is written by resolve() before any executor runs), but the executor then
+    raised while performing the action. No Outcome was recorded. This is NOT
+    a lost escalation -- call execute_approved(action_id) to retry once the
+    underlying problem (e.g. a downstream API outage in a real executor) is
+    resolved; executors.run()'s outcome_lookup guard makes retries idempotent.
+    Wraps the original exception as __cause__."""
+
+    def __init__(self, action_id: str, original: BaseException):
+        super().__init__(f"action {action_id} was approved but execution failed: {original}")
+        self.action_id = action_id
+
+
 def park(conn, envelope: ActionEnvelope, decision: Decision) -> None:
     """Record a pending approval. decision.status must be ESCALATE -- this
     function doesn't re-check policy, it just persists what evaluate() already
@@ -104,14 +123,97 @@ def resolve_and_execute(conn, action_id: str, *, approved: bool, by: str) -> Out
     """Shared by main.py's CLI and dashboard.py's HTTP routes (PLAN.md s5:
     "Phase 2 CLI and Phase 3 HTTP call the same three functions") -- this is
     the fourth: resolve() plus, if approved, running the executor. Returns
-    None for a rejected/denied resolution (nothing executes)."""
+    None for a rejected/denied resolution (nothing executes).
+
+    approval is durably committed by resolve() above BEFORE the executor
+    ever runs, so a failure here does not undo it -- see ExecutionFailed.
+    executors.run()'s own three guard exceptions (NotAuthorized,
+    PayloadMismatchError, ExecutorMissing) are tamper/config signals PLAN.md
+    already names as "abort", not something a retry fixes, so they propagate
+    unwrapped. Anything else -- the executor's own body, e.g. a real Stripe
+    or SMTP call -- can raise an unenumerable variety of exceptions, exactly
+    like the one deliberate broad catch in guardian/policy_agent.py; those
+    get wrapped so callers have a single, named, retryable failure mode
+    instead of an arbitrary crash."""
     decision = resolve(conn, action_id, approved=approved, by=by)
     if decision.status is not DecisionStatus.ALLOW:
         return None
     row = db.get_escalation(conn, action_id)
     action = ActionEnvelope.model_validate_json(row["envelope_json"]).action
-    return executors.run(
-        action, decision,
-        outcome_lookup=lambda aid: auditor.outcome_for(conn, aid),
-        outcome_record=lambda o: auditor.record_outcome(conn, o),
+    try:
+        return executors.run(
+            action, decision,
+            outcome_lookup=lambda aid: auditor.outcome_for(conn, aid),
+            outcome_record=lambda o: auditor.record_outcome(conn, o),
+        )
+    except (executors.NotAuthorized, executors.PayloadMismatchError, executors.ExecutorMissing):
+        raise
+    except Exception as exc:
+        raise ExecutionFailed(action_id, exc) from exc
+
+
+def _approved_decision(row) -> Decision:
+    """Reconstructs the executable ALLOW Decision for a row already in
+    status='approved', from the escalate-time Decision stored at park() plus
+    the resolution metadata db.resolve_escalation() recorded (resolved_by).
+    Used by execute_approved() and unexecuted() to retry/display execution
+    against an already-approved row without re-running resolve() (which
+    requires status='pending' and would raise AlreadyResolved here)."""
+    stored_decision = Decision.model_validate_json(row["decision_json"])
+    envelope = ActionEnvelope.model_validate_json(row["envelope_json"])
+    return Decision(
+        action_id=row["action_id"],
+        status=DecisionStatus.ALLOW,
+        matched_rules=stored_decision.matched_rules,
+        rule_id=stored_decision.rule_id,
+        policy_version=stored_decision.policy_version,
+        reasoning=f"human approved by {row['resolved_by']} (was: {stored_decision.reasoning})",
+        decided_by="human",
+        payload_hash=envelope.action.payload_hash(),
     )
+
+
+def execute_approved(conn, action_id: str) -> Outcome:
+    """Retries execution for an action already approved (status='approved')
+    whose prior attempt raised ExecutionFailed. Does NOT require
+    status='pending' and never touches escalation status -- it only
+    re-invokes executors.run(), whose outcome_lookup guard already makes
+    this safe to call repeatedly (a call after a successful retry just
+    returns the recorded Outcome again, no double-execution).
+
+    Raises NotApproved if the row isn't status='approved' (still pending, or
+    was rejected) and UnknownEscalation if action_id was never parked."""
+    row = db.get_escalation(conn, action_id)
+    if row is None:
+        raise UnknownEscalation(action_id)
+    if row["status"] != "approved":
+        raise NotApproved(f"{action_id} is {row['status']}, not approved")
+
+    decision = _approved_decision(row)
+    envelope = ActionEnvelope.model_validate_json(row["envelope_json"])
+    try:
+        return executors.run(
+            envelope.action, decision,
+            outcome_lookup=lambda aid: auditor.outcome_for(conn, aid),
+            outcome_record=lambda o: auditor.record_outcome(conn, o),
+        )
+    except (executors.NotAuthorized, executors.PayloadMismatchError, executors.ExecutorMissing):
+        raise
+    except Exception as exc:
+        raise ExecutionFailed(action_id, exc) from exc
+
+
+def unexecuted(conn, session_id: str | None = None) -> list[dict]:
+    """Approved escalations with no recorded Outcome -- stuck by a prior
+    ExecutionFailed. Same dict shape as pending() (plus resolved_by/at) for
+    CLI/dashboard reuse."""
+    rows = db.get_unexecuted_approvals(conn, session_id=session_id)
+    return [
+        {
+            "envelope": ActionEnvelope.model_validate_json(row["envelope_json"]),
+            "decision": _approved_decision(row),
+            "resolved_by": row["resolved_by"],
+            "resolved_at": row["resolved_at"],
+        }
+        for row in rows
+    ]
