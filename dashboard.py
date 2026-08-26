@@ -13,7 +13,7 @@ can reach this process's port can approve or reject pending escalations, the
 same as anyone with terminal access to `python main.py resolve` could. Do not
 expose this to an untrusted network without adding auth first.
 
-Run: uvicorn dashboard:app --reload --port 8000  (or python dashboard.py)
+Run: uvicorn dashboard:app --reload --port 8001  (or python dashboard.py)
 """
 from __future__ import annotations
 
@@ -304,4 +304,4 @@ def get_policy_version():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8001)
