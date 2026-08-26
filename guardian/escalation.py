@@ -8,8 +8,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 import db
-import guardian.auditor as auditor
-import guardian.executors as executors
+from guardian.execution import run_with_audit
 from guardian.executors import ExecutionFailed  # re-exported: callers here
                                                   # catch esc.ExecutionFailed,
                                                   # same class executors.run()
@@ -126,11 +125,7 @@ def resolve_and_execute(conn, action_id: str, *, approved: bool, by: str) -> Out
         return None
     row = db.get_escalation(conn, action_id)
     action = ActionEnvelope.model_validate_json(row["envelope_json"]).action
-    return executors.run(
-        action, decision,
-        outcome_lookup=lambda aid: auditor.outcome_for(conn, aid),
-        outcome_record=lambda o: auditor.record_outcome(conn, o),
-    )
+    return run_with_audit(conn, action, decision)
 
 
 def _approved_decision(row) -> Decision:
@@ -158,7 +153,8 @@ def execute_approved(conn, action_id: str) -> Outcome:
     """Retries execution for an action already approved (status='approved')
     whose prior attempt raised ExecutionFailed. Does NOT require
     status='pending' and never touches escalation status -- it only
-    re-invokes executors.run(), whose outcome_lookup guard already makes
+    re-invokes the executor (via guardian.execution.run_with_audit), whose
+    outcome_lookup guard already makes
     this safe to call repeatedly (a call after a successful retry just
     returns the recorded Outcome again, no double-execution).
 
@@ -172,11 +168,7 @@ def execute_approved(conn, action_id: str) -> Outcome:
 
     decision = _approved_decision(row)
     envelope = ActionEnvelope.model_validate_json(row["envelope_json"])
-    return executors.run(
-        envelope.action, decision,
-        outcome_lookup=lambda aid: auditor.outcome_for(conn, aid),
-        outcome_record=lambda o: auditor.record_outcome(conn, o),
-    )
+    return run_with_audit(conn, envelope.action, decision)
 
 
 def unexecuted(conn, session_id: str | None = None) -> list[dict]:

@@ -62,15 +62,73 @@ CREATE TABLE IF NOT EXISTS escalations (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_esc_pending ON escalations(status, created_at);
+
+-- Single-row table recording which schema generation this file was written by.
+-- Added before the first public release deliberately: once someone outside this
+-- repo holds a guardian.db, a schema change with no version to branch on has no
+-- safe migration path, and the audit trail is the one thing that must never be
+-- dropped and recreated.
+CREATE TABLE IF NOT EXISTS schema_version (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  version INTEGER NOT NULL
+);
 """
+
+# Bump when _SCHEMA changes shape, and add the corresponding step to _migrate().
+SCHEMA_VERSION = 1
+
+
+class SchemaTooNew(Exception):
+    """The database was written by a newer Guardian than this one. Refuse to
+    open it rather than silently reading columns we don't understand -- same
+    fail-closed posture policy.yaml gets at startup (PLAN.md s3.3)."""
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring an existing database up to SCHEMA_VERSION, or stamp a fresh one.
+
+    A file predating the schema_version table reads back as no row at all.
+    That is indistinguishable from a brand-new database by inspection, so both
+    are stamped at the current version -- safe only because every table above
+    is CREATE TABLE IF NOT EXISTS and version 1 is additive over the original
+    four-table layout. The first version that is NOT additive must branch here
+    on the stored value instead of assuming this.
+    """
+    row = conn.execute("SELECT version FROM schema_version WHERE id = 1").fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT INTO schema_version (id, version) VALUES (1, ?)", (SCHEMA_VERSION,)
+        )
+        return
+    found = row["version"] if isinstance(row, sqlite3.Row) else row[0]
+    if found > SCHEMA_VERSION:
+        raise SchemaTooNew(
+            f"guardian.db is schema v{found}, this build understands v{SCHEMA_VERSION}"
+        )
+    # found < SCHEMA_VERSION: future migration steps land here, in order.
+
+
+def configure(conn: sqlite3.Connection) -> sqlite3.Connection:
+    """Apply the connection settings, schema, and version stamp that EVERY
+    caller needs. Shared so a second entry point can't quietly open the same
+    database with different durability settings -- dashboard.py builds its own
+    connection (it needs check_same_thread=False) and must route through here.
+    """
+    conn.row_factory = sqlite3.Row
+    # WAL lets readers proceed during a write instead of blocking on the
+    # database-level lock. Persists in the file once set, so it survives
+    # reconnects. Required before anything concurrent touches this database:
+    # the default rollback journal serializes readers against writers, which
+    # turns every audit read into contention with the write path.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.executescript(_SCHEMA)
+    _migrate(conn)
+    conn.commit()
+    return conn
 
 
 def init_db(path: str = "guardian.db") -> sqlite3.Connection:
-    conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
-    conn.executescript(_SCHEMA)
-    conn.commit()
-    return conn
+    return configure(sqlite3.connect(path))
 
 
 def insert_action(conn: sqlite3.Connection, envelope: ActionEnvelope) -> None:

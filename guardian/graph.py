@@ -11,8 +11,8 @@ from langgraph.graph import END, START, StateGraph
 
 import db
 import guardian.auditor as auditor
-import guardian.executors as executors
 import guardian.policy_agent as policy_agent
+from guardian.execution import run_with_audit
 from guardian.history import SQLiteHistoryQuery
 from schemas import ActionEnvelope, Decision, DecisionStatus, Outcome
 
@@ -64,12 +64,7 @@ def build_graph(conn):
         return state
 
     def execute(state: GuardianState) -> GuardianState:
-        outcome = executors.run(
-            state["envelope"].action,
-            state["decision"],
-            outcome_lookup=lambda action_id: auditor.outcome_for(conn, action_id),
-            outcome_record=lambda o: auditor.record_outcome(conn, o),
-        )
+        outcome = run_with_audit(conn, state["envelope"].action, state["decision"])
         return {**state, "outcome": outcome}
 
     graph = StateGraph(GuardianState)
@@ -108,8 +103,9 @@ def retry_execution(conn, action_id: str) -> Outcome:
     executors.ExecutionFailed. The ALLOW decision is already durably
     recorded (record_decision ran before execute in the graph above), so
     this reconstructs the Action + Decision straight from db.py and
-    re-invokes executors.run() directly, without going through the graph
-    again -- re-running record_proposal/evaluate_policy/record_decision
+    re-invokes the executor (via guardian.execution.run_with_audit) without
+    going through the graph again -- re-running
+    record_proposal/evaluate_policy/record_decision
     would be redundant at best and, for evaluate_policy, actively wrong: a
     live policy.yaml edit between the original run and this retry must not
     silently re-judge an already-decided action (PLAN.md s2.2: a Decision,
@@ -122,11 +118,7 @@ def retry_execution(conn, action_id: str) -> Outcome:
     decision = db.get_decision(conn, action_id)
     if decision is None or decision.status is not DecisionStatus.ALLOW:
         raise NotAllowed(f"{action_id} has no ALLOW decision to retry")
-    return executors.run(
-        action, decision,
-        outcome_lookup=lambda aid: auditor.outcome_for(conn, aid),
-        outcome_record=lambda o: auditor.record_outcome(conn, o),
-    )
+    return run_with_audit(conn, action, decision)
 
 
 def unexecuted_allows(conn, session_id: str | None = None) -> list[dict]:
