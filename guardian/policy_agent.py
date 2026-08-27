@@ -14,7 +14,7 @@ from typing import Protocol
 import yaml
 
 from guardian import predicates
-from schemas import Action, ActionType, Decision, DecisionStatus
+from schemas import Action, Decision, DecisionStatus
 
 
 class HistoryQuery(Protocol):
@@ -22,9 +22,9 @@ class HistoryQuery(Protocol):
     actions never count toward a cumulative cap, or a rejected action would
     consume the victim's own limit."""
 
-    def sum_amount_cents(self, *, agent: str, action_type: ActionType, window: timedelta) -> int: ...
-    def count(self, *, agent: str, action_type: ActionType, window: timedelta) -> int: ...
-    def distinct_targets(self, *, agent: str, action_type: ActionType, window: timedelta) -> int: ...
+    def sum_amount_cents(self, *, agent: str, action_type: str, window: timedelta) -> int: ...
+    def count(self, *, agent: str, action_type: str, window: timedelta) -> int: ...
+    def distinct_targets(self, *, agent: str, action_type: str, window: timedelta) -> int: ...
 
 
 _SEVERITY_RANK = {

@@ -14,7 +14,7 @@ import guardian.auditor as auditor
 import guardian.policy_agent as policy_agent
 from guardian.execution import run_with_audit
 from guardian.history import SQLiteHistoryQuery
-from schemas import ActionEnvelope, Decision, DecisionStatus, Outcome
+from schemas import ActionEnvelope, Decision, DecisionStatus, Outcome, UnregisteredActionType
 
 
 class NoSuchAction(Exception):
@@ -128,12 +128,24 @@ def unexecuted_allows(conn, session_id: str | None = None) -> list[dict]:
     unexecuted() ({"envelope", "decision"}, since an escalation stores the
     full ActionEnvelope including LLM reasoning): a non-escalated action was
     never parked, so there is no stored envelope/reasoning to reconstruct
-    here, only the Action and its Decision."""
+    here, only the Action and its Decision.
+
+    A row whose action_type is no longer registered (design doc 2026-08-24
+    s12c: the open registry can drift between when an action was proposed and
+    when this list is read) still appears here rather than vanishing --
+    "action" is None and "error" carries why, so a genuinely stuck action
+    doesn't silently disappear from the retry list just because its type was
+    deregistered. One unreconstructable row must not crash the whole listing
+    for every OTHER stuck action either, hence the per-row try/except."""
     rows = db.get_unexecuted_allows(conn, session_id=session_id)
-    return [
-        {
-            "action": db.get_action(conn, row["action_id"]),
-            "decision": db.get_decision(conn, row["action_id"]),
-        }
-        for row in rows
-    ]
+    result = []
+    for row in rows:
+        entry = {"decision": db.get_decision(conn, row["action_id"])}
+        try:
+            entry["action"] = db.get_action(conn, row["action_id"])
+            entry["error"] = None
+        except UnregisteredActionType as exc:
+            entry["action"] = None
+            entry["error"] = str(exc)
+        result.append(entry)
+    return result

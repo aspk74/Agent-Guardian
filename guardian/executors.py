@@ -24,6 +24,14 @@ class ExecutorMissing(Exception):
     that EXECUTORS never learned about."""
 
 
+class DuplicateExecutor(Exception):
+    """register_executor() called twice for the same action_type. Mirrors
+    guardian/registry.py's DuplicateRegistration -- same reasoning: silently
+    letting a second registration win would mean whichever import happened
+    last wins, which is exactly the kind of load-order-dependent behavior a
+    security product cannot have."""
+
+
 class ExecutionFailed(Exception):
     """The executor itself raised while performing the action (e.g. a real
     Stripe/SMTP call failing) -- distinct from this module's other three
@@ -85,6 +93,22 @@ EXECUTORS = {
     ActionType.WRITE_FILE: _simulate_write,
     ActionType.DELETE_FILE: _simulate_delete,
 }
+
+
+def register_executor(action_type: str, fn) -> None:
+    """The open-registry counterpart to the five built-ins above (design doc
+    2026-08-24 s7b/s13): guardian/sdk.py's @guarded calls this at decoration
+    time so a customer-registered action_type gets a real executor the same
+    way guardian/registry.py gets its Params/target_field entry -- one call,
+    same moment, so the two can never drift apart for an SDK-registered type.
+
+    fn: Action -> Outcome, same contract as the built-in _simulate_* functions
+    above. guardian/sdk.py supplies a closure that calls the customer's own
+    tool function and wraps its return value into an Outcome.
+    """
+    if action_type in EXECUTORS:
+        raise DuplicateExecutor(f"{action_type!r} already has a registered executor")
+    EXECUTORS[action_type] = fn
 
 
 def run(action: Action, decision: Decision, *, outcome_lookup, outcome_record) -> Outcome:
