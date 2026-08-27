@@ -144,7 +144,7 @@ def insert_action(conn: sqlite3.Connection, envelope: ActionEnvelope) -> None:
             action.id,
             action.session_id,
             action.requesting_agent,
-            action.action_type.value,
+            action.action_type,
             action.target,
             action.params.model_dump_json(),
             envelope.reasoning,
@@ -190,7 +190,7 @@ def insert_outcome(conn: sqlite3.Connection, outcome: Outcome) -> None:
         (
             outcome.action_id,
             outcome.requesting_agent,
-            outcome.action_type.value,
+            outcome.action_type,
             outcome.status,
             outcome.detail,
             outcome.executed_at.isoformat(),
@@ -208,7 +208,7 @@ def get_outcome(conn: sqlite3.Connection, action_id: str) -> Outcome | None:
     return Outcome(
         action_id=row["action_id"],
         requesting_agent=row["requesting_agent"],
-        action_type=ActionType(row["action_type"]),
+        action_type=row["action_type"],
         status=row["status"],
         detail=row["detail"],
         executed_at=row["executed_at"],
@@ -217,10 +217,17 @@ def get_outcome(conn: sqlite3.Connection, action_id: str) -> Outcome | None:
 
 def get_action(conn: sqlite3.Connection, action_id: str) -> Action | None:
     """Reconstructs the full typed Action (params included) from the actions
-    table. params discriminates on its embedded "kind" field (schemas.py's
-    Field(discriminator="kind")), so this works for any action_type without
-    a per-type branch -- unlike guardian/auditor.py's report(), which only
-    ever needs PaymentParams for one report line and hardcodes that."""
+    table. Action's own _resolve_params_class validator (schemas.py) looks up
+    the stored action_type in guardian/registry.py to know which concrete
+    Params class the params JSON validates against, so this works for any
+    registered action_type without a per-type branch here -- unlike
+    guardian/auditor.py's report(), which only ever needs PaymentParams for
+    one report line and hardcodes that.
+
+    Raises schemas.UnregisteredActionType if action_type isn't registered in
+    THIS process -- a real historical record that can no longer be fully
+    reconstructed, not a "not found" (that's the row-is-None case above,
+    which returns None instead)."""
     row = conn.execute("SELECT * FROM actions WHERE id = ?", (action_id,)).fetchone()
     if row is None:
         return None
@@ -228,7 +235,7 @@ def get_action(conn: sqlite3.Connection, action_id: str) -> Action | None:
         id=row["id"],
         session_id=row["session_id"],
         requesting_agent=row["requesting_agent"],
-        action_type=ActionType(row["action_type"]),
+        action_type=row["action_type"],
         target=row["target"],
         params=json.loads(row["params_json"]),
         created_at=row["created_at"],
@@ -350,7 +357,13 @@ def get_decisions_for_session(conn: sqlite3.Connection, session_id: str) -> list
 
 
 def get_outcomes_for_session(conn: sqlite3.Connection, session_id: str) -> list[Outcome]:
-    """Outcomes join to actions on action_id, same reasoning as decisions above."""
+    """Outcomes join to actions on action_id, same reasoning as decisions above.
+
+    Outcome.action_type is a plain str field (no registry lookup, no
+    _resolve_params_class validator -- that's an Action/params thing), so
+    unlike get_action() there is no UnregisteredActionType failure mode here
+    to tolerate: a historical action_type that's no longer registered is
+    still perfectly valid Outcome data."""
     rows = conn.execute(
         """
         SELECT outcomes.*
@@ -365,7 +378,7 @@ def get_outcomes_for_session(conn: sqlite3.Connection, session_id: str) -> list[
         Outcome(
             action_id=row["action_id"],
             requesting_agent=row["requesting_agent"],
-            action_type=ActionType(row["action_type"]),
+            action_type=row["action_type"],
             status=row["status"],
             detail=row["detail"],
             executed_at=row["executed_at"],
@@ -420,7 +433,7 @@ def get_payment_totals_by_agent(conn: sqlite3.Connection, since: str) -> list[sq
           AND outcomes.status = 'success'
           AND outcomes.executed_at >= ?
         """,
-        (ActionType.MAKE_PAYMENT.value, since),
+        (ActionType.MAKE_PAYMENT, since),
     ).fetchall()
     totals: dict[str, int] = {}
     for row in rows:

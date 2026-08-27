@@ -28,33 +28,57 @@ load_dotenv()
 
 import sqlite3
 
+import yaml
+
 import db
 import guardian.escalation as esc
 import guardian.graph as graph
 import guardian.policy_agent as policy_agent
+import guardian.registry as registry
 
 DB_PATH = os.environ.get("GUARDIAN_DB", "guardian.db")
 POLICY_PATH = os.environ.get("GUARDIAN_POLICY", "policy.yaml")
 
 app = FastAPI(title="Guardian Dashboard")
 
-# One connection for the process lifetime, not one per request: db.init_db()
+# One connection for the process lifetime, not one per request: db.configure()
 # re-runs the full CREATE TABLE/INDEX IF NOT EXISTS schema script and a
 # commit, which is wasted work on every single HTTP request, and a fresh
 # sqlite3.Connection per request that's never closed leaks file descriptors
 # under sustained traffic. FastAPI's sync `def` routes run in a threadpool,
 # so this connection needs check_same_thread=False -- db.init_db() doesn't
-# expose that constructor flag (main.py's CLI never needs it: one
-# connection per process invocation, always on the main thread), so the
-# schema init is repeated here rather than widening init_db()'s signature
-# for its one caller that needs a different flag. sqlite serializes writers
-# internally, and each request does one short operation, not an interleaved
-# multi-statement transaction, so sharing this connection across threads is
-# safe.
-_conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-_conn.row_factory = sqlite3.Row
-_conn.executescript(db._SCHEMA)
-_conn.commit()
+# expose that constructor flag (main.py's CLI never needs it: one connection
+# per process invocation, always on the main thread), so this module opens
+# the connection itself and routes it through db.configure() -- the same
+# WAL-mode-plus-schema-version setup init_db() uses -- rather than
+# duplicating that setup by hand. sqlite serializes writers internally, and
+# each request does one short operation, not an interleaved multi-statement
+# transaction, so sharing this connection across threads is safe.
+_conn = db.configure(sqlite3.connect(DB_PATH, check_same_thread=False))
+
+# E3 (design doc, accepted 2026-08-25): same boot-time coverage warning
+# main.py's cmd_run prints, so the dashboard-only path doesn't silently skip
+# it. Advisory only -- an uncovered type still escalates correctly under
+# SYS-GAP, this just makes the gap visible before an agent hits it.
+with open(POLICY_PATH, "rb") as _f:
+    _uncovered = registry.uncovered_action_types(yaml.safe_load(_f)["rules"])
+if _uncovered:
+    print(
+        f"WARNING: no policy.yaml rule covers: "
+        f"{', '.join(_uncovered)}. Proposals of these types "
+        f"will escalate under SYS-GAP until a rule is added."
+    )
+
+# 7b's executor half of the same check -- see main.py's
+# warn_uncovered_action_types for why this is a separate list from the
+# rule-coverage one above.
+_missing_executors = registry.uncovered_executors()
+if _missing_executors:
+    print(
+        f"WARNING: no executor registered for: "
+        f"{', '.join(_missing_executors)}. An ALLOWed proposal of these "
+        f"types will fail with ExecutorMissing."
+    )
 
 
 def _get_conn():
@@ -68,7 +92,7 @@ def _render_row(row: dict) -> str:
     return f"""
     <tr>
       <td>{html.escape(action.requesting_agent)}</td>
-      <td>{html.escape(action.action_type.value)}</td>
+      <td>{html.escape(action.action_type)}</td>
       <td>{html.escape(action.target)}</td>
       <td>{html.escape(decision.rule_id or "")}</td>
       <td>{html.escape(decision.reasoning)}</td>
@@ -98,7 +122,7 @@ def _render_stuck_row(row: dict) -> str:
     return f"""
     <tr>
       <td>{html.escape(action.requesting_agent)}</td>
-      <td>{html.escape(action.action_type.value)}</td>
+      <td>{html.escape(action.action_type)}</td>
       <td>{html.escape(action.target)}</td>
       <td>{html.escape(row["resolved_by"] or "")}</td>
       <td>
@@ -112,15 +136,35 @@ def _render_stuck_row(row: dict) -> str:
 def _render_stuck_allow_row(row: dict) -> str:
     """Auto-allowed (never escalated) but never executed -- same failure
     shape as _render_stuck_row's escalation case, but there's no
-    'approved by' since a policy rule allowed it, not a human."""
+    'approved by' since a policy rule allowed it, not a human.
+
+    row["action"] is None when guardian.graph.unexecuted_allows() couldn't
+    reconstruct it (action_type no longer registered -- registry drift since
+    it was proposed, design doc 2026-08-24 s12c). Retry is still offered:
+    action_id comes from the Decision, which always reconstructs (it carries
+    no params), and a re-registered type makes the retry succeed normally --
+    this must stay visible and actionable, not silently vanish from the list."""
     action = row["action"]
+    decision = row["decision"]
+    if action is None:
+        action_id = html.escape(decision.action_id)
+        return f"""
+    <tr>
+      <td colspan="3"><em>action_type no longer registered: {html.escape(row["error"] or "")}</em></td>
+      <td>{html.escape(decision.rule_id or "")}</td>
+      <td>
+        <form method="post" action="/retry/{action_id}" style="display:inline">
+          <button type="submit">Retry execution</button>
+        </form>
+      </td>
+    </tr>"""
     action_id = html.escape(action.id)
     return f"""
     <tr>
       <td>{html.escape(action.requesting_agent)}</td>
-      <td>{html.escape(action.action_type.value)}</td>
+      <td>{html.escape(action.action_type)}</td>
       <td>{html.escape(action.target)}</td>
-      <td>{html.escape(row["decision"].rule_id or "")}</td>
+      <td>{html.escape(decision.rule_id or "")}</td>
       <td>
         <form method="post" action="/retry/{action_id}" style="display:inline">
           <button type="submit">Retry execution</button>
@@ -172,7 +216,7 @@ def list_stuck(session_id: str | None = None):
         {
             "action_id": r["envelope"].action.id,
             "agent": r["envelope"].action.requesting_agent,
-            "action_type": r["envelope"].action.action_type.value,
+            "action_type": r["envelope"].action.action_type,
             "target": r["envelope"].action.target,
             "resolved_by": r["resolved_by"],
             "resolved_at": r["resolved_at"],
@@ -184,19 +228,36 @@ def list_stuck(session_id: str | None = None):
 @app.get("/stuck-allows")
 def list_stuck_allows(session_id: str | None = None):
     """JSON equivalent of the auto-allow stuck-actions table, same
-    graph.unexecuted_allows() call the CLI's `resolve` command retries."""
+    graph.unexecuted_allows() call the CLI's `resolve` command retries.
+
+    r["action"] is None for a row whose action_type is no longer registered
+    (see _render_stuck_allow_row's docstring) -- still returned, with
+    action_id/error in place of the fields that need a reconstructed Action,
+    same principle as the HTML view: stays visible and retryable, never
+    silently dropped."""
     conn = _get_conn()
     rows = graph.unexecuted_allows(conn, session_id=session_id)
-    return [
-        {
-            "action_id": r["action"].id,
-            "agent": r["action"].requesting_agent,
-            "action_type": r["action"].action_type.value,
-            "target": r["action"].target,
-            "rule_id": r["decision"].rule_id,
-        }
-        for r in rows
-    ]
+    result = []
+    for r in rows:
+        if r["action"] is None:
+            result.append({
+                "action_id": r["decision"].action_id,
+                "agent": None,
+                "action_type": None,
+                "target": None,
+                "rule_id": r["decision"].rule_id,
+                "error": r["error"],
+            })
+        else:
+            result.append({
+                "action_id": r["action"].id,
+                "agent": r["action"].requesting_agent,
+                "action_type": r["action"].action_type,
+                "target": r["action"].target,
+                "rule_id": r["decision"].rule_id,
+                "error": None,
+            })
+    return result
 
 
 @app.get("/pending")
@@ -208,7 +269,7 @@ def list_pending(session_id: str | None = None):
         {
             "action_id": r["envelope"].action.id,
             "agent": r["envelope"].action.requesting_agent,
-            "action_type": r["envelope"].action.action_type.value,
+            "action_type": r["envelope"].action.action_type,
             "target": r["envelope"].action.target,
             "rule_id": r["decision"].rule_id,
             "rule_reasoning": r["decision"].reasoning,
