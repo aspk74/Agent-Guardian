@@ -23,6 +23,8 @@ from dotenv import load_dotenv
 
 load_dotenv()  # loads .env if present; never overwrites a var already set in the real environment
 
+import yaml
+
 import db
 import guardian.auditor as auditor
 import guardian.coverage_check as coverage_check
@@ -30,9 +32,45 @@ import guardian.escalation as esc
 import guardian.executors as executors
 import guardian.graph as graph
 import guardian.policy_agent as policy_agent
+import guardian.registry as registry
 from agents.finance_agent import FinanceAgent
 from demo_scenarios import SCENARIOS
 from schemas import ActionEnvelope, Decision, DecisionStatus
+
+
+def warn_uncovered_action_types(policy_path: str = "policy.yaml") -> None:
+    """E3 (design doc, accepted 2026-08-25): every registered ActionType with
+    zero policy.yaml rules mentioning it falls through to SYS-GAP at the
+    moment an agent actually proposes it (policy_agent.py:70-80) -- correct,
+    but silent until then. This surfaces the same gap at startup instead,
+    loudly, without changing evaluate()'s runtime behavior at all: a proposal
+    of an uncovered type still escalates exactly as before, this is purely
+    operator visibility."""
+    with open(policy_path, "rb") as f:
+        rules = yaml.safe_load(f)["rules"]
+    uncovered = registry.uncovered_action_types(rules)
+    if uncovered:
+        names = ", ".join(uncovered)
+        print(
+            f"WARNING: no policy.yaml rule covers: {names}. Proposals of these "
+            f"types will escalate under SYS-GAP until a rule is added.",
+            file=sys.stderr,
+        )
+
+    # 7b's other half: a registered type with no executor raises
+    # ExecutorMissing on its first ALLOWed proposal, not before -- same
+    # "invisible until triggered" shape as the rule-coverage gap above.
+    # Structurally unreachable for anything registered through
+    # guardian.sdk.guarded() (it registers both atomically); this is a
+    # backstop for a type registered via registry.register() directly.
+    missing_executors = registry.uncovered_executors()
+    if missing_executors:
+        names = ", ".join(missing_executors)
+        print(
+            f"WARNING: no executor registered for: {names}. An ALLOWed "
+            f"proposal of these types will fail with ExecutorMissing.",
+            file=sys.stderr,
+        )
 
 AGENTS = {"finance": FinanceAgent}
 
@@ -80,7 +118,7 @@ def _prompt_approval(envelope: ActionEnvelope, decision: Decision) -> bool:
     where guessing the human's intent from a malformed answer is not okay."""
     print(f"\n  *** ESCALATION *** action {envelope.action.id}")
     print(f"      agent: {envelope.action.requesting_agent}")
-    print(f"      type:  {envelope.action.action_type.value} -> {envelope.action.target}")
+    print(f"      type:  {envelope.action.action_type} -> {envelope.action.target}")
     print(f"      rule:  {decision.rule_id} -- {decision.reasoning}")
     print(f"      LLM reasoning (audit-only): {envelope.reasoning!r}")
     while True:
@@ -102,6 +140,7 @@ def cmd_run(name: str, session_id: str, *, db_path: str, by: str) -> None:
         print(f"Unknown scenario: {name}. Known: {list(SCENARIOS)}", file=sys.stderr)
         sys.exit(1)
 
+    warn_uncovered_action_types()
     conn = db.init_db(db_path)
     agent_classes = _load_agents()
     workers = {}
@@ -118,7 +157,7 @@ def cmd_run(name: str, session_id: str, *, db_path: str, by: str) -> None:
 
         envelope = worker.handle(task, session_id=session_id)
         print(f"\n[{agent_name}] task: {task!r}")
-        print(f"  action: {envelope.action.action_type.value} -> {envelope.action.target}")
+        print(f"  action: {envelope.action.action_type} -> {envelope.action.target}")
         print(f"  reasoning (LLM, audit-only): {envelope.reasoning!r}")
 
         try:

@@ -27,7 +27,7 @@ from pydantic import BaseModel
 
 from guardian.llm_json import PARSE_ERRORS as _PARSE_ERRORS
 from guardian.llm_json import strip_code_fence as _strip_code_fence
-from schemas import Action, ActionEnvelope, ActionType
+from schemas import Action, ActionEnvelope
 
 
 class ActionValidationError(Exception):
@@ -48,7 +48,7 @@ class WorkerAgent:
             target_field = "counterparty"
     """
 
-    action_type: ActionType
+    action_type: str
     params_model: type[BaseModel]
     target_field: str  # name of the params_model field to use as Action.target
 
@@ -81,7 +81,7 @@ system. You propose actions; you never execute them -- a separate guardian proce
 evaluates and may allow, deny, or escalate your proposal to a human.
 
 You will be given a task in natural language. Decide on ONE concrete action of type \
-"{self.action_type.value}" that accomplishes it, then respond with ONLY a single JSON \
+"{self.action_type}" that accomplishes it, then respond with ONLY a single JSON \
 object and nothing else: no markdown code fences, no prose before or after it.
 
 The JSON object must have exactly this shape:
