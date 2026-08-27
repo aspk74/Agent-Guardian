@@ -12,6 +12,7 @@ import fnmatch
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
+from guardian.history import AmountlessActionType
 from schemas import Action
 
 if TYPE_CHECKING:
@@ -26,15 +27,26 @@ def rule_matches(action: Action, history: "HistoryQuery", rule: dict) -> bool:
     """
     when = rule["when"]
 
-    if when["action_type"] != action.action_type.value:
+    if when["action_type"] != action.action_type:
         return False
 
     if "amount_cents_gt" in when:
-        # action.params is PaymentParams whenever action_type == make_payment
-        # by construction (schemas.py discriminated union). If it were ever
-        # the wrong type, AttributeError below is a genuine bug worth
-        # surfacing as SYS-ERR, not something to guard against here.
-        if not (action.params.amount_cents > when["amount_cents_gt"]):
+        # Read amount_cents structurally rather than assuming PaymentParams --
+        # the same convention guardian/history.py's sum_amount_cents reads
+        # for cumulative caps, so a single-payment cap and a cumulative cap
+        # agree on what "has an amount" means for a customer-registered
+        # action type. A type whose params carry no amount_cents (or a
+        # non-integer one) is a policy-authoring bug: raise so the ONE
+        # catch-all in guardian/policy_agent.py turns it into a fail-closed
+        # SYS-ERR deny, rather than silently never matching this rule.
+        amount = getattr(action.params, "amount_cents", None)
+        if amount is None or isinstance(amount, bool) or not isinstance(amount, int):
+            raise AmountlessActionType(
+                f"action type '{action.action_type}' has no integer "
+                f"amount_cents in its params; an amount_cents_gt rule cannot "
+                f"apply to it"
+            )
+        if not (amount > when["amount_cents_gt"]):
             return False
 
     if "sum_amount_cents_gt" in when:
