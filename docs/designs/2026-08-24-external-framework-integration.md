@@ -11,13 +11,14 @@ sections below were written under the superseded commercial premise and are mark
 | # | Decision | Effect on this doc |
 |---|---|---|
 | D1 | **Open-core.** OSS the enforcement engine; commercial layer stays possible later, not now. | §3's "sellable to startups" premise is superseded. See §3d. |
-| D2 | ~~Extract core, then MCP proxy as the first integration.~~ **PROVISIONAL — blocked on a spike.** | §5-rev's central claim is **false for stdio MCP**. See §12. |
-| — | **Bespoke `Action` wire protocol CUT from phase 1.** MCP is already the wire protocol. | Holds only if D2 survives the spike. |
+| D2 | ~~Extract core, then MCP proxy as the first integration.~~ **DECIDED AGAINST, 2026-08-25.** First integration is now the **in-process hook/SDK (mode A)**. | §5-rev is superseded. See §13. |
+| — | ~~Bespoke `Action` wire protocol CUT from phase 1.~~ Moot — no wire protocol needed for an in-process call. | — |
 | D3 | Review posture: SELECTIVE EXPANSION. | Three expansions accepted, see §9-rev. |
 
-> ⚠️ **§5-rev is known to be partly wrong. Read §12 before acting on this document.**
-> The 11-section deep review and an independent outside-voice review ran on 2026-08-25.
-> D2's justification did not survive. Do not start building the proxy.
+> ⚠️ **§5-rev and §9-rev's phasing are superseded. Read §13 before acting on this document.**
+> The spike (S1-S3) ran against the MCP spec directly on 2026-08-25 and returned a decisive
+> answer, not an ambiguous one. Do not build the MCP proxy as phase 1. §13 has the verdict,
+> the spec citations, and the revised plan.
 
 Full rationale and the deferred list: `~/.gstack/projects/Agent-Guardian/ceo-plans/2026-08-25-open-core-mcp-proxy.md`
 
@@ -699,6 +700,117 @@ adoption bottleneck for every policy engine (see OPA/Rego). E5's quickstart carr
 demo; E2 (`explain`) and E6 (replay against an edited policy) determine whether *minute 61* —
 the user writes their own rule and it doesn't fire — ends in a working policy or a closed tab.
 Given §12d, minute 61 is currently a wall. Revisit after the spike.
+
+---
+
+## 13. Spike results (2026-08-25) and revised D2
+
+The three questions from §12f were answered directly against the MCP spec
+(2025-06-18) and, for S1, against real client config conventions. All three
+citations are verbatim.
+
+### S1 — Credentials (nuanced; practical conclusion unchanged)
+
+Spec: *"In the stdio transport: The client launches the MCP server as a
+subprocess."* Every major MCP client (Claude Desktop, Cursor, VS Code) injects
+credentials into that subprocess's environment straight from the client's own
+config file — e.g. `"env": {"STRIPE_API_KEY": "..."}` on the server's entry in
+`mcpServers`. This is universal convention, not implementation-specific.
+
+This does not make custody separation *impossible* — if Guardian holds the
+downstream credential in its own secret store, never present in the agent's
+config at all, the agent genuinely never sees it. That is a real architecture.
+It requires the operator configuring the agent's MCP client to be a different
+party from whoever can obtain the raw credential — a platform/security team
+issuing scoped access to individual engineers, say. **It is not the
+architecture for a solo builder or small team, who almost always already hold
+the raw provider key directly** (from the Stripe dashboard, say) and can
+trivially reconstruct a bypass entry with it. For Guardian's actual near-term
+audience, S1 delivers the outside voice's conclusion in practice even though
+the underlying mechanism is more nuanced than "credentials can't move."
+
+### S2 — Approval pause (dead, no ambiguity)
+
+Spec, Lifecycle → Timeouts: *"Implementations SHOULD establish timeouts for
+all sent requests... Implementations SHOULD always enforce a maximum timeout,
+regardless of progress notifications, to limit the impact of a misbehaving
+client or server."* No protocol construct exists for holding a request open
+for an arbitrary human-approval duration.
+
+The one candidate, `elicitation/create`, fails on three independent grounds:
+- **Schema is flat only.** *"Elicitation schemas are limited to flat objects
+  with primitive properties only... complex nested structures, arrays of
+  objects, and other advanced JSON Schema features are intentionally not
+  supported."* An `Action` cannot be carried without inventing an ad hoc
+  flattening.
+- **Explicitly barred from this use.** *"Servers MUST NOT use elicitation to
+  request sensitive information."* A payment/refund approval is not obviously
+  outside that bar.
+- **No identity in the response.** The result is `{"action": "accept",
+  "content": {...matching the requested schema...}}`. No approver field, no
+  session identity beyond whatever the client app itself tracks internally
+  and chooses not to expose to MCP.
+
+### S3 — Agent identity (dead, no ambiguity)
+
+Spec, Lifecycle → Initialization: `clientInfo` is `{"name", "title",
+"version"}`, sent once in the `initialize` request, self-reported, no
+cryptographic binding, not verified anywhere in the spec. The only
+server-assigned identifier anywhere in the base protocol is Streamable HTTP's
+`Mcp-Session-Id` — HTTP-only (no stdio equivalent), identifies a *connection*,
+not an agent, assigned fresh on every reconnect. There is no mechanism for a
+proxy to reliably distinguish one calling agent from another, or to stop an
+agent from relaunching to reset whatever counter was tracking it. Every
+cumulative rule in `policy.yaml` (FIN-002 included) depends on exactly the
+identity guarantee that does not exist here.
+
+### Verdict
+
+Two of three legs fail at the protocol level with no workaround available to
+an MCP-proxy implementation. The third technically works but only for a
+deployment shape (centralized credential ownership, separate from the agent
+operator) that is not what open-core Guardian is shipping to first. **D2 as
+originally scoped — MCP proxy first, justified by free credential custody and
+lowest adoption friction — is decided against.**
+
+### Revised D2: in-process hook (mode A) is the first integration
+
+Mode A, described in §5 and dismissed there only on the (now-moot) grounds
+that MCP offered a strictly better tradeoff, becomes phase 1:
+
+- **Identity** is supplied directly by the calling code, the same way
+  `agents/base.py:7-11` already refuses to trust the model for
+  `requesting_agent`. No protocol field to spoof, because there is no
+  protocol.
+- **Approval** uses §12e's error-and-retry pattern, not suspend/resume: return
+  a structured "blocked, approval pending, id=X" and let the caller's next
+  turn re-invoke. This was already engineered safe by rev 2 defect 5 —
+  `payload_hash` binds an approval to its exact original payload, so a retry
+  with a *different* payload is correctly evaluated fresh rather than riding
+  a stale approval (`executors.py:96`, `escalation.py:85`). No new mechanism
+  required, no protocol timeout to fight.
+- **Credentials** are wherever the customer's tool code already puts them.
+  Mode A never claimed custody separation (§5's honest non-negotiable: never
+  let mode A borrow mode C's guarantee) — it wasn't the value proposition, so
+  losing it costs nothing that wasn't already priced in.
+
+MCP interposition is not dead. It becomes a **later adapter**, scoped
+correctly this time to the deployment where S1's custody separation is real —
+an operator who owns credential issuance separately from agent configuration.
+That is a legitimate enterprise topology; it is just not phase 1, and it is
+no longer justified by a claim that turned out to be false.
+
+### Task list changes
+
+- S1-S4 (the spike) are complete as of this section.
+- T5 (MCP proxy), T2 (unknown-tool blocking), T6 (shadow mode as a proxy
+  flag), T15 (quickstart) are **retargeted from proxy to in-process hook** —
+  same finding, same priority, different transport.
+- T1 (write-ahead record) still applies: the concurrency race and
+  lost-response problem are not MCP-specific, they follow from any
+  concurrent caller of the core, in-process or not.
+- New task: build the mode-A registration contract from §6 (`@guarded`,
+  `ActionSpec`, mandatory `target_field`) as the actual phase-1 deliverable.
 
 ---
 
