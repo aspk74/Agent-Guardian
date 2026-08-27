@@ -11,12 +11,24 @@ import json
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Literal, Union
+from typing import Any, Literal, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SerializeAsAny, model_validator
 
 
-class ActionType(str, Enum):
+class ActionType:
+    """Well-known action types this repo ships with, as plain strings --
+    dotted access (`ActionType.MAKE_PAYMENT`) for ergonomics and backward
+    compatibility with when this was a closed `Enum`.
+
+    This is NOT the authority on which action_type strings are usable in a
+    given process -- guardian/registry.py's registry is (design doc
+    2026-08-24 s2, s6: ActionType/Params became an open registry rather than
+    a closed set, so a caller can register any string action_type with its
+    own Params model). `Action.action_type` and `Outcome.action_type` are
+    typed as plain `str` for exactly that reason: any registered string is
+    valid, not only these five.
+    """
     SEND_EMAIL = "send_email"
     MAKE_PAYMENT = "make_payment"
     READ_FILE = "read_file"
@@ -24,7 +36,28 @@ class ActionType(str, Enum):
     DELETE_FILE = "delete_file"
 
 
-# --- typed params, discriminated union. no untyped dict on the policy boundary ---
+class UnregisteredActionType(Exception):
+    """Reconstructing an Action/ActionEnvelope from stored JSON referenced an
+    action_type with no registered Params model in THIS process.
+
+    Raised from Action._resolve_params_class below, at the point of
+    deserializing FROM a raw dict/JSON -- never from the normal construction
+    path (a WorkerAgent/mode-A adapter passing an already-validated Params
+    instance directly), since only a raw, not-yet-typed params dict triggers
+    the registry lookup at all. Callers reconstructing historical or stored
+    data (db.py's audit reads, guardian/escalation.py's parked-escalation
+    reads) can catch this and degrade gracefully -- skip one unreconstructable
+    row rather than let it crash a listing of many -- instead of a raw,
+    uninformative ValueError from Python's own Enum machinery, which is what
+    happened here before ActionType stopped being a closed Enum.
+    """
+
+
+# --- typed params. no untyped dict on the policy boundary. ---
+# Params is registered per-action-type in guardian/registry.py, not enumerated
+# here as a closed Union -- these three ship as the built-ins, registered by
+# registry.py on import, exactly the way a customer's own Params model for a
+# custom action_type would be. Nothing here is special-cased for them.
 
 class PaymentParams(BaseModel):
     kind: Literal["payment"] = "payment"
@@ -45,6 +78,10 @@ class FileParams(BaseModel):
     path: str
 
 
+# Kept as a documentation-only alias of the built-in three -- nothing in this
+# file types a field against it any more (see Action.params below), but it's
+# a convenient closed-set reference for code that specifically wants "one of
+# the types this repo ships with," e.g. a test enumerating the built-ins.
 Params = Union[PaymentParams, EmailParams, FileParams]
 
 
@@ -54,10 +91,58 @@ class Action(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     session_id: str
     requesting_agent: str
-    action_type: ActionType
+    action_type: str
     target: str
-    params: Params = Field(discriminator="kind")
+    # SerializeAsAny: params holds a concrete Params subclass (PaymentParams,
+    # a customer's own RefundParams, etc.), and without SerializeAsAny,
+    # Pydantic v2 would serialize a field typed as the bare BaseModel using
+    # ONLY BaseModel's own (zero) declared fields, silently dropping every
+    # subclass field on model_dump()/payload_hash() -- SerializeAsAny tells
+    # Pydantic to serialize using the value's actual runtime type instead.
+    params: SerializeAsAny[BaseModel]
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @model_validator(mode="before")
+    @classmethod
+    def _resolve_params_class(cls, data: Any) -> Any:
+        """Only fires when reconstructing from a raw dict (JSON deserialize)
+        with `params` still a plain dict rather than an already-validated
+        Params instance -- the normal construction path (agents/base.py's
+        `self.params_model(**kwargs)`, or a mode-A adapter doing the same)
+        passes an already-typed instance straight through untouched, since
+        `isinstance(params, dict)` is False for it.
+
+        This is a deferred import, not a module-level one: guardian/registry.py
+        imports schemas.py at ITS top level (to get ActionType/PaymentParams/
+        etc.), so importing it back here at schemas.py's own top level would
+        be circular. By the time any Action is actually constructed, both
+        modules are already fully loaded, so the import inside this method
+        body is safe -- a standard way to break an import cycle without
+        merging the two modules.
+        """
+        if not isinstance(data, dict):
+            return data
+        params = data.get("params")
+        if not isinstance(params, dict):
+            return data
+        action_type = data.get("action_type")
+        if action_type is None:
+            return data
+
+        import guardian.registry as registry
+
+        try:
+            reg = registry.get(action_type)
+        except registry.UnregisteredActionType as exc:
+            raise UnregisteredActionType(
+                f"action_type {action_type!r} has no registered params model in "
+                f"this process (was it renamed, or registered by a different "
+                f"process?)"
+            ) from exc
+
+        data = dict(data)
+        data["params"] = reg.params_model.model_validate(params)
+        return data
 
     def payload_hash(self) -> str:
         """Canonical sha256 over everything except created_at, so re-hashing
@@ -102,7 +187,7 @@ class Outcome(BaseModel):
 
     action_id: str
     requesting_agent: str
-    action_type: ActionType
+    action_type: str
     status: Literal["success", "failed"]
     detail: str
     executed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
