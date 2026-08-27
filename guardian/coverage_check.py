@@ -22,8 +22,8 @@ import yaml
 from pydantic import BaseModel
 
 import guardian.policy_agent as policy_agent
+import guardian.registry as registry
 from guardian.llm_json import PARSE_ERRORS, strip_code_fence
-from schemas import ActionType
 
 
 class CoverageCheckError(Exception):
@@ -46,7 +46,10 @@ class CoverageReport(BaseModel):
 
 
 def _system_prompt(policy_yaml_text: str, retry_note: str | None = None) -> str:
-    action_types = ", ".join(t.value for t in ActionType)
+    # Reads the live registry, not a hardcoded enum -- so this reflects
+    # whatever's actually registered in THIS process (built-ins plus any
+    # customer-registered types), not a fixed set frozen at write time.
+    action_types = ", ".join(registry.all_registered())
     prompt = f"""You are a policy-coverage auditor for an agent-guardian system. You are given \
 the full contents of policy.yaml below. Your job is to find GAPS and RISKS, never to approve \
 anything.

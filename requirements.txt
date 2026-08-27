@@ -9,3 +9,4 @@ fastapi
 uvicorn
 python-multipart
 httpx
+git+https://github.com/JuliusBrussee/caveman.git
