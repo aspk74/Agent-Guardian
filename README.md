@@ -2,6 +2,10 @@
 
 A safety layer for AI agents that take real-world actions (paying money, sending emails, deleting files).
 
+## In short
+
+AI agents propose actions instead of doing them directly. A guardian checks each proposal against rules you define, then allows it, blocks it, or pauses it for a human to approve. Every decision is logged. Right now the actual sending/paying/deleting is simulated (printed, not performed), so you can safely test the guardrails before connecting any real payment, email, or file system.
+
 ## The problem this solves
 
 If you let an AI agent send emails, move money, or delete files on its own, you have to trust it never makes a mistake — and you have no easy way to stop it or review what it did. This project puts a **guardian** in between the agent and the outside world:
