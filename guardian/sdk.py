@@ -195,39 +195,135 @@ def _find_matching_escalation(conn: sqlite3.Connection, action: Action) -> dict 
 
 
 def _submit(ctx: _Context, action: Action) -> Outcome:
-    history = SQLiteHistoryQuery(ctx.conn)
-    decision = policy_agent.evaluate(action, history, policy_path=ctx.policy_path)
-    envelope = ActionEnvelope(
-        action=action,
-        reasoning="(guardian.sdk: no LLM reasoning, action built directly from call args)",
-        model="guardian-sdk",
-        raw_response="",
-    )
+    """T1 fix (eng review 2026-08-29): the read-history -> evaluate -> decide
+    sequence below runs inside a single `BEGIN IMMEDIATE` transaction, with a
+    `reservations` row (db.py) inserted BEFORE history is read.
 
-    if decision.status is DecisionStatus.DENY:
+    Why this closes the race: without it, two concurrent @guarded calls in
+    the same session could both call SQLiteHistoryQuery against a cumulative
+    cap (e.g. FIN-002's "total payments today < $X") before either one's
+    action had produced a decision or an outcome. Both would read the same
+    stale total, both evaluate the cap as not-yet-crossed, and both get
+    ALLOW -- a classic TOCTOU bypass of the cap.  `BEGIN IMMEDIATE` acquires
+    SQLite's write lock up front (rather than only at COMMIT, like a plain
+    `BEGIN`/implicit transaction would), so a second concurrent caller
+    reaching its own `BEGIN IMMEDIATE` blocks until the first caller's
+    transaction commits or rolls back -- there is no window where both are
+    mid-evaluation at once. Inserting the reservation before reading history
+    (rather than only recording the eventual decision) is what makes the
+    *second* caller's history read, once it gets its turn, see the *first*
+    caller's action at all: `guardian/history.py`'s SQLiteHistoryQuery now
+    folds in still-pending `reservations` rows alongside executed outcomes,
+    so caller 2 sees caller 1's in-flight amount even though caller 1 hasn't
+    reached a decision yet, let alone executed.
+
+    All db.* calls in this function that must NOT end the transaction early
+    (insert_reservation, release_reservation) are documented as such at their
+    definitions in db.py -- every commit point below is deliberate and
+    explicit, not incidental.
+    """
+    ctx.conn.execute("BEGIN IMMEDIATE")
+    try:
+        db.insert_reservation(ctx.conn, action)
+        # exclude_action_id=action.id: this action's own reservation (just
+        # inserted above) must be visible to any OTHER concurrent caller's
+        # history read, but not to this evaluate() call's own -- see
+        # db.get_pending_reservation_totals()'s docstring. Without this,
+        # guardian/predicates.py's sum_amount_cents_gt check (which adds the
+        # candidate's own amount on top of "history" itself, PLAN.md s9.3)
+        # would double-count this action against its own cap.
+        history = SQLiteHistoryQuery(ctx.conn, exclude_action_id=action.id)
+        decision = policy_agent.evaluate(action, history, policy_path=ctx.policy_path)
+        envelope = ActionEnvelope(
+            action=action,
+            reasoning="(guardian.sdk: no LLM reasoning, action built directly from call args)",
+            model="guardian-sdk",
+            raw_response="",
+        )
+
+        if decision.status is DecisionStatus.DENY:
+            # Denied attempts never count toward a cumulative cap (PLAN A4) --
+            # release this action's own reservation in the same transaction
+            # that records the deny, so it stops counting the instant the
+            # deny is decided rather than lingering until some later cleanup.
+            db.insert_action(ctx.conn, envelope)
+            db.insert_decision(ctx.conn, decision)
+            db.release_reservation(ctx.conn, action.id)
+            ctx.conn.commit()
+            raise ActionDenied(action.id, decision.reasoning)
+
+        if decision.status is DecisionStatus.ESCALATE:
+            match = _find_matching_escalation(ctx.conn, action)
+            if match is None:
+                # First time this semantic action has been proposed: park it,
+                # and leave ITS OWN reservation (inserted above) pending --
+                # an escalated action is provisionally still "reserved"
+                # against the cap while awaiting a human, exactly like an
+                # ALLOW is reserved while awaiting execution. It is released
+                # below, on a later call, once a human resolves it either way.
+                db.insert_action(ctx.conn, envelope)
+                esc.park(ctx.conn, envelope, decision)
+                ctx.conn.commit()
+                raise ActionPending(action.id)
+
+            # A retry of an already-parked semantic action: THIS call's own
+            # reservation (for action.id, a freshly-generated id distinct
+            # from the original match["action_id"]) is redundant -- the
+            # original proposal's reservation already covers this action
+            # against the cap, however this retry resolves. Release it here
+            # so a customer's framework retrying ActionPending in a loop
+            # never accumulates one extra phantom reservation per retry.
+            db.release_reservation(ctx.conn, action.id)
+            if match["status"] == "pending":
+                ctx.conn.commit()
+                raise ActionPending(match["action_id"])
+            if match["status"] == "rejected":
+                # Human rejected it: release the ORIGINAL reservation too --
+                # a rejected action must not permanently consume the cap it
+                # was provisionally reserved against (same rule as DENY above).
+                db.release_reservation(ctx.conn, match["action_id"])
+                ctx.conn.commit()
+                raise ActionDenied(match["action_id"], "human rejected this action")
+            # "approved": already resolved since the last call. Commit now
+            # (releasing the write lock) before executing -- execution can be
+            # slow/re-entrant and must not hold the write lock. The ORIGINAL
+            # reservation is released after execute_approved() durably
+            # records the outcome, outside this transaction (see below):
+            # execute_approved()'s own outcome_lookup guard (via
+            # executors.run) makes this idempotent if called again after a
+            # successful execution.
+            ctx.conn.commit()
+            outcome = esc.execute_approved(ctx.conn, match["action_id"])
+            # Execution succeeded (execute_approved raises otherwise, and
+            # this line is then never reached -- the reservation is left
+            # pending, which is the correct fail-closed direction: still
+            # over-counted against the cap rather than silently dropped).
+            # No BEGIN IMMEDIATE needed here: a single DELETE is already
+            # atomic, and nothing concurrent needs to be excluded from a
+            # release, only from the read-evaluate step above.
+            db.release_reservation(ctx.conn, match["action_id"])
+            ctx.conn.commit()
+            return outcome
+
+        # ALLOW: commit the reservation + decision now, releasing the write
+        # lock, then execute outside the transaction (same reasoning as the
+        # approved-escalation retry above -- execution must not hold the
+        # lock). This action's own reservation is released once its outcome
+        # is durably recorded; until then it correctly keeps counting toward
+        # the cap for any concurrent sibling call still inside its own
+        # BEGIN IMMEDIATE waiting on this one.
         db.insert_action(ctx.conn, envelope)
         db.insert_decision(ctx.conn, decision)
-        raise ActionDenied(action.id, decision.reasoning)
-
-    if decision.status is DecisionStatus.ESCALATE:
-        match = _find_matching_escalation(ctx.conn, action)
-        if match is None:
-            db.insert_action(ctx.conn, envelope)
-            esc.park(ctx.conn, envelope, decision)
-            raise ActionPending(action.id)
-        if match["status"] == "pending":
-            raise ActionPending(match["action_id"])
-        if match["status"] == "rejected":
-            raise ActionDenied(match["action_id"], "human rejected this action")
-        # "approved": already resolved since the last call. execute_approved()'s
-        # own outcome_lookup guard (via executors.run) makes this idempotent
-        # if called again after a successful execution.
-        return esc.execute_approved(ctx.conn, match["action_id"])
-
-    # ALLOW
-    db.insert_action(ctx.conn, envelope)
-    db.insert_decision(ctx.conn, decision)
-    return run_with_audit(ctx.conn, action, decision)
+        ctx.conn.commit()
+        outcome = run_with_audit(ctx.conn, action, decision)
+        # Same reasoning as the approved-escalation release above: reached
+        # only on success, and a plain DELETE needs no transaction of its own.
+        db.release_reservation(ctx.conn, action.id)
+        ctx.conn.commit()
+        return outcome
+    except BaseException:
+        ctx.conn.rollback()
+        raise
 
 
 def guarded(spec: ActionSpec):
