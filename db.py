@@ -63,6 +63,52 @@ CREATE TABLE IF NOT EXISTS escalations (
 );
 CREATE INDEX IF NOT EXISTS idx_esc_pending ON escalations(status, created_at);
 
+-- T1 fix (eng review 2026-08-29, design doc 2026-08-24 s"T1"): a separate
+-- table, NOT a repurposing of `outcomes`. guardian/sdk.py:_submit() inserts a
+-- row here the instant an action is proposed, still inside the same
+-- `BEGIN IMMEDIATE` transaction that will go on to read history and evaluate
+-- policy -- so a second concurrent caller's history read (guardian/history.py)
+-- sees the first caller's in-flight action via this table, and a cumulative
+-- cap (e.g. FIN-002) can no longer be bypassed by two callers who both read
+-- history before either of them writes an outcome.
+--
+-- status is 'pending' from the moment the row is inserted until the
+-- proposing call reaches a terminal disposition:
+--   - DENY: released (deleted) in the same transaction that records the deny.
+--   - ALLOW: left 'pending' until execution finishes; run_with_audit's
+--     eventual `outcomes` row is what a *future* action actually needs to see
+--     (this row's job was only to protect the decision that already happened),
+--     so it is released once the outcome is durably recorded. If the process
+--     crashes between commit and that release, the row is simply left behind
+--     -- see get_stale_reservations() below for why that is safe to leave
+--     uncleaned rather than needing its own recovery job.
+--   - ESCALATE: left 'pending' for as long as the escalation itself is
+--     pending (an escalated action is provisionally still "reserved" against
+--     the cap while awaiting a human), then released the moment a human
+--     rejects it (the cap must not be permanently consumed by an action that
+--     never happened) or converted the same way ALLOW is once a human
+--     approves and it executes.
+--
+-- Deliberately NOT `outcomes`: db.py's existing stuck-action recovery
+-- (get_unexecuted_allows / get_unexecuted_approvals) both mean "outcomes has
+-- no row for this decided action_id" as their entire signal for "crashed
+-- mid-execution, needs a retry." Writing a reservation row into `outcomes`
+-- (even under a different status value) would make an unexecuted ALLOW
+-- indistinguishable from one that already ran, silently disabling that
+-- recovery path -- exactly what the eng review flagged and told us not to do.
+CREATE TABLE IF NOT EXISTS reservations (
+  action_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  requesting_agent TEXT NOT NULL,
+  action_type TEXT NOT NULL,
+  target TEXT NOT NULL,
+  params_json TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reservations_window
+  ON reservations(requesting_agent, action_type, status);
+
 -- Single-row table recording which schema generation this file was written by.
 -- Added before the first public release deliberately: once someone outside this
 -- repo holds a guardian.db, a schema change with no version to branch on has no
@@ -75,7 +121,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 """
 
 # Bump when _SCHEMA changes shape, and add the corresponding step to _migrate().
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class SchemaTooNew(Exception):
@@ -93,6 +139,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
     is CREATE TABLE IF NOT EXISTS and version 1 is additive over the original
     four-table layout. The first version that is NOT additive must branch here
     on the stored value instead of assuming this.
+
+    v2 (the `reservations` table, T1 fix) is additive the same way: by the
+    time this function runs, `configure()` has already executed the full
+    `_SCHEMA` script, so a v1 database on disk already has the new table
+    before this function ever inspects the stored version number -- there is
+    no data to backfill, only the version stamp itself needs to catch up.
     """
     row = conn.execute("SELECT version FROM schema_version WHERE id = 1").fetchone()
     if row is None:
@@ -105,7 +157,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         raise SchemaTooNew(
             f"guardian.db is schema v{found}, this build understands v{SCHEMA_VERSION}"
         )
-    # found < SCHEMA_VERSION: future migration steps land here, in order.
+    if found < SCHEMA_VERSION:
+        # v1 -> v2: reservations table already exists (see docstring above);
+        # only the stamp needs bumping. The next non-additive change must
+        # branch on `found` here instead of a single unconditional UPDATE.
+        conn.execute("UPDATE schema_version SET version = ? WHERE id = 1", (SCHEMA_VERSION,))
 
 
 def configure(conn: sqlite3.Connection) -> sqlite3.Connection:
@@ -524,3 +580,181 @@ def resolve_escalation(
     )
     conn.commit()
     return cursor.rowcount == 1
+
+
+# --- reservations (T1 fix: see the CREATE TABLE comment in _SCHEMA above) ---
+
+
+def insert_reservation(conn: sqlite3.Connection, action) -> None:
+    """Records `action` as provisionally in-flight, status='pending'.
+
+    Deliberately does NOT call conn.commit(). Every other insert_* in this
+    file commits immediately because each is used standalone -- but this one
+    exists specifically to be called from inside guardian/sdk.py:_submit()'s
+    `BEGIN IMMEDIATE` transaction, in between opening that transaction and
+    reading history. Committing here would end that transaction early and
+    release the write lock before the history read/evaluate it's meant to
+    protect ever happens, defeating the entire point of the fix. The caller
+    (_submit) is responsible for the eventual commit or rollback.
+    """
+    conn.execute(
+        """
+        INSERT INTO reservations (
+          action_id, session_id, requesting_agent, action_type, target,
+          params_json, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+        """,
+        (
+            action.id,
+            action.session_id,
+            action.requesting_agent,
+            action.action_type,
+            action.target,
+            action.params.model_dump_json(),
+            action.created_at.isoformat(),
+        ),
+    )
+
+
+def release_reservation(conn: sqlite3.Connection, action_id: str) -> None:
+    """Removes a reservation once it no longer needs to count against a
+    cumulative cap: a DENY, an ESCALATE later rejected by a human (the cap
+    must not stay permanently consumed by an action that never happened), or
+    an ALLOW/approved-ESCALATE whose outcome has now been durably recorded
+    (at that point `outcomes` itself is what future history reads see, so
+    keeping the reservation around too would double-count it).
+
+    Also does not commit -- see insert_reservation's docstring. Every call
+    site commits (or is already inside a transaction some other statement
+    will commit) immediately after this, same convention as the rest of this
+    module's write functions used together.
+    """
+    conn.execute("DELETE FROM reservations WHERE action_id = ?", (action_id,))
+
+
+def get_pending_reservation_totals(
+    conn: sqlite3.Connection, *, agent: str, action_type: str, exclude_action_id: str | None = None
+) -> list[str]:
+    """Returns the raw params_json of every still-pending reservation for
+    this agent/action_type, for guardian/history.py's SQLiteHistoryQuery to
+    fold into its cumulative sums/counts alongside executed outcomes.
+
+    exclude_action_id: guardian/predicates.py's sum_amount_cents_gt check
+    deliberately computes `history.sum_amount_cents(...) + action.params.amount_cents`
+    itself (PLAN.md s9.3 -- the candidate hasn't executed yet, so its own
+    amount must be added exactly once by the caller, not folded into
+    "history"). guardian/sdk.py:_submit() inserts the candidate's OWN
+    reservation before evaluating specifically so a *different* concurrent
+    caller's history read sees it -- but that means this action's own row is
+    now sitting in the `reservations` table when ITS OWN evaluate() call
+    queries history, and without this exclusion it would be double-counted
+    (once here, once by predicates.py's explicit "+ own amount"). Passing the
+    current action's id here is what keeps self-evaluation exactly as
+    before, while still making the row visible to everyone else.
+
+    No time window filter, unlike outcomes' executed_at-based queries: a
+    reservation has no natural "age" to judge -- it exists only from the
+    moment an action is proposed until it resolves to a terminal state
+    (released or converted into an outcome), which is always well inside any
+    cap's window_hours. Including a stale one left behind by a crashed
+    process is deliberately not a correctness problem here (see db.py's
+    schema comment and guardian/sdk.py's docstring for the crash-recovery
+    story) -- it stays cheap to just always count.
+    """
+    if exclude_action_id is None:
+        rows = conn.execute(
+            """
+            SELECT params_json FROM reservations
+            WHERE requesting_agent = ? AND action_type = ? AND status = 'pending'
+            """,
+            (agent, action_type),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT params_json FROM reservations
+            WHERE requesting_agent = ? AND action_type = ? AND status = 'pending'
+              AND action_id != ?
+            """,
+            (agent, action_type, exclude_action_id),
+        ).fetchall()
+    return [row["params_json"] for row in rows]
+
+
+def count_pending_reservations(
+    conn: sqlite3.Connection, *, agent: str, action_type: str, exclude_action_id: str | None = None
+) -> int:
+    """Counterpart to get_pending_reservation_totals() for SQLiteHistoryQuery.count(),
+    which doesn't need the params payload, just how many are in flight. Same
+    exclude_action_id reasoning as get_pending_reservation_totals()."""
+    if exclude_action_id is None:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS n FROM reservations
+            WHERE requesting_agent = ? AND action_type = ? AND status = 'pending'
+            """,
+            (agent, action_type),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS n FROM reservations
+            WHERE requesting_agent = ? AND action_type = ? AND status = 'pending'
+              AND action_id != ?
+            """,
+            (agent, action_type, exclude_action_id),
+        ).fetchone()
+    return row["n"]
+
+
+def get_pending_reservation_targets(
+    conn: sqlite3.Connection, *, agent: str, action_type: str, exclude_action_id: str | None = None
+) -> list[str]:
+    """Counterpart to get_pending_reservation_totals() for
+    SQLiteHistoryQuery.distinct_targets(). Same exclude_action_id reasoning."""
+    if exclude_action_id is None:
+        rows = conn.execute(
+            """
+            SELECT target FROM reservations
+            WHERE requesting_agent = ? AND action_type = ? AND status = 'pending'
+            """,
+            (agent, action_type),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT target FROM reservations
+            WHERE requesting_agent = ? AND action_type = ? AND status = 'pending'
+              AND action_id != ?
+            """,
+            (agent, action_type, exclude_action_id),
+        ).fetchall()
+    return [row["target"] for row in rows]
+
+
+def get_reservation(conn: sqlite3.Connection, action_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM reservations WHERE action_id = ?", (action_id,)
+    ).fetchone()
+
+
+def get_stale_reservations(conn: sqlite3.Connection, older_than: str) -> list[sqlite3.Row]:
+    """Pending reservations created before `older_than` (an isoformat
+    timestamp) -- left behind by a process that crashed between committing
+    the reservation and reaching a terminal disposition for it (DENY/release,
+    or execution completing and releasing on success).
+
+    Not wired into automatic startup cleanup: get_pending_reservation_totals()
+    above counts every pending reservation regardless of age on purpose (its
+    own docstring explains why that is safe rather than a bug), so a stale
+    row is inert except for one thing -- it holds a slightly conservative
+    (over-counts, never under-counts) cumulative-cap total until cleared,
+    which is the fail-closed direction, not the fail-open one this repo
+    treats as a real defect. This query exists so an operator (or a future
+    scheduled job, matching the shape of main.py's existing `resolve`
+    stuck-action sweep) can find and clear genuinely abandoned rows without
+    the system needing to guess a safe timeout on its own."""
+    return conn.execute(
+        "SELECT * FROM reservations WHERE status = 'pending' AND created_at < ? ORDER BY created_at",
+        (older_than,),
+    ).fetchall()
