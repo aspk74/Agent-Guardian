@@ -26,6 +26,10 @@ AI agent decides what it wants to do
 
 The agent never gets to act directly — it can only *propose* an action. Every proposal is checked against a rule file (`policy.yaml`) before anything happens, and every decision is written to a permanent log.
 
+## Who this is for
+
+Anyone prototyping AI agents that need to take real-world actions but wants a human-in-the-loop safety net before wiring up real money, email, or file access — a policy engine, approval queue, and audit log you can point at your own rules.
+
 ## The three agents in this demo
 
 - **Finance agent** — proposes payments
