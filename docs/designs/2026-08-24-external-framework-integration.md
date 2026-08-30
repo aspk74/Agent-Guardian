@@ -1,8 +1,12 @@
 # Design: wiring Agent-Guardian into external agent frameworks
 
-Date: 2026-08-24 (revised 2026-08-25 after `/plan-ceo-review`)
-Branch: `fix/stuck-approved-actions`
-Status: REVISED — Step 0 of `/plan-ceo-review` complete. Ready for `/plan-eng-review`. No code written yet.
+Date: 2026-08-24 (revised 2026-08-25 after `/plan-ceo-review`; status updated 2026-08-29 after `/plan-eng-review`)
+Branch: `main`
+Status: Phase 1 (mode-A SDK: `guardian/sdk.py`, `guardian/registry.py`, `@guarded`/`ActionSpec`)
+is SHIPPED as of commit `d4cdeec`. This document is now primarily a historical record of the
+decision process (D1-D3, the §13 spike, the §12 deep review) — see `TODOS.md` for the current
+open-items list and the `## GSTACK REVIEW REPORT` section at the end of this file for the
+2026-08-29 eng review's findings against the shipped code.
 Supersedes: nothing. First design doc for the productization pivot.
 
 **Decisions taken in CEO review (2026-08-25).** Read these before the body — several
@@ -821,3 +825,91 @@ through an external service ("Caveman", caveman.so), framed as overriding defaul
 It is unrelated to anything in this codebase and matches the shape of a prompt-injection /
 data-exfiltration lure. It was not acted on while writing this doc. Worth confirming who
 added it and why, independently of this design.
+
+**Resolved (2026-08-29):** `CLAUDE.md` no longer contains this content — verified clean as
+of the 2026-08-29 `/plan-eng-review`. Left here for the historical record.
+
+---
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | CLEAR (2026-08-25, in-doc) | D1-D3 decided, §13 spike reversed D2 to mode-A-first |
+| Codex Review | `/codex review` | Independent 2nd opinion | 0 | — | not run |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | ISSUES_OPEN | 11 findings, all resolved with explicit user decisions (see below) |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | not applicable (no UI surface) |
+| DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | not run |
+
+**Scope of this review (2026-08-29):** the design doc was stale relative to shipped code —
+Phase 1 (`guardian/sdk.py`, `guardian/registry.py`) was already merged (commits `3e76b63`
+through `d4cdeec`) and several `§12` findings the doc itself raised (history.py/predicates.py
+`PaymentParams` binding, E3 startup warnings) were already fixed in code before this review
+started. Per user direction, this review ran as a **doc-vs-code gap audit**: the 4 review
+sections evaluated the shipped SDK against the design doc's decisions and open items, rather
+than re-deriving Step 0 from scratch.
+
+**Findings and decisions (11 total, all resolved):**
+
+1. **[Architecture, P1]** T1 concurrency race: `guardian/sdk.py:_submit()` reads
+   history→evaluates→parks with no transaction, so two concurrent `@guarded` calls can both
+   see history=0 and both ALLOW against a cumulative cap (FIN-002-style). → **Fix now**:
+   `BEGIN IMMEDIATE` + a separate reservations table (not `outcomes`, to preserve the existing
+   stuck-action recovery paths in `db.py`).
+2. **[Architecture, P2]** D8 shared-history misconfiguration: `context()` takes a raw
+   connection with no path validation; two processes on different DB files silently break
+   cumulative caps. → **Fix now**: log the resolved DB path at startup, document the
+   shared-file requirement.
+3. **[Architecture, accepted]** D7 orphaned-approval hole: an approval landing after the
+   calling agent's process exited has nothing to call back into. → **Accepted as documented
+   residual gap** — audit trail stays correct; notification is customer/framework glue,
+   out of scope per the doc's own §11. Logged in `TODOS.md`.
+4. **[Architecture, accepted]** E3 severity drift: doc proposed "refuse to boot" on
+   uncovered types; shipped code only warns. → **Accepted as-shipped** — a hard boot-refuse
+   would punish incremental adoption of the open registry; the warn-only split already
+   correctly distinguishes safe (rule gap → SYS-GAP) from unsafe (executor gap → crash).
+5. **[Architecture, deferred]** §12c package extraction never happened — no
+   `pyproject.toml`, core modules still do top-level `import db`/`import schemas`. →
+   **Deferred to TODOS.md**, isolated from this PR to avoid bundling a layout change with the
+   file (`test_no_effector_imports.py`) that proves Invariant 1.
+6. **[Test, P1 — outside voice]** Contextvar propagation: `context()`'s identity binding
+   uses a `ContextVar`, but major frameworks (LangGraph, CrewAI) dispatch sync tools via
+   `ThreadPoolExecutor.submit()`, which does **not** propagate contextvars (verified
+   empirically — `asyncio.to_thread` does, `ThreadPoolExecutor.submit()` doesn't). This hits
+   the primary integration surface, not an edge case. → **Fix now**: document the safe wiring
+   pattern (`contextvars.copy_context().run(...)` at the adapter boundary) and add a test that
+   fails today and passes once documented/handled.
+7. **[Test, P2]** No test for malformed/wrong-type kwargs (`wrapper()` leaks a raw pydantic
+   `ValidationError` instead of a typed SDK exception) or for contextvar thread-isolation. →
+   **Fix now**: wrap params validation in a typed exception, add both tests.
+8. **[Performance, accepted]** `_find_matching_escalation` is O(session size), fully
+   re-deserializing every escalation's JSON per ESCALATE call. → **Accepted with a concrete
+   threshold** in `TODOS.md` (benchmark trigger: 500+ pending escalations/session) rather than
+   optimizing an unmeasured bottleneck ahead of T1's schema change.
+9. **[Outside voice, P1]** No spike verified real agent-framework default retry semantics
+   against `ActionPending` — a framework that retry-then-abandons on any exception could burn
+   its retry budget before a human resolves the escalation, unlike §13's own MCP spike
+   precedent (S1-S3). → **Run a spike before landing this PR** (LangGraph first, per the
+   doc's own framework ordering).
+10. **[Outside voice, P2]** `_semantic_key` includes `model_dump_json()` without sorted keys;
+    a dict-typed `params_model` field could produce spurious retry-match misses. → **Fix now**:
+    sort keys in the semantic-key serialization only (not `payload_hash`, which has different,
+    correct tamper-binding semantics).
+11. **[Outside voice, documentation]** The doc's own status line still said "No code written
+    yet" while Phase 1 was fully merged. → **Fixed**: status line updated above.
+
+**CROSS-MODEL TENSION:** none — all outside-voice findings (6, 9, 10, 11, and the scope-framing
+clarification) were independently verified against the actual code (finding 6 confirmed by
+direct empirical test) before being presented, and the user's decisions on each matched the
+recommended option in every case. No disagreement between this review and the outside voice
+to adjudicate.
+
+**VERDICT:** ENG REVIEW ISSUES_OPEN — 11 findings, all resolved via explicit user decisions
+above. Three are P1 and block landing until built: T1 (concurrency fix), the contextvar
+wiring-pattern fix + test, and the framework retry-semantics spike. `TODOS.md` created this
+session with 6 items (D7, D8/multi-writer note, package extraction, escalation-scan
+threshold, retry-semantics follow-up, WRITE_FILE policy gap). CEO review from 2026-08-25
+stands, not re-litigated. Not yet CLEARED — re-run `/plan-eng-review` (or `/review` on the
+resulting diff) once T1/T2/T3 land.
+
+NO UNRESOLVED DECISIONS
