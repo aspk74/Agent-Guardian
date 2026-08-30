@@ -51,6 +51,8 @@ Plain-English version of the built-in rules:
 
 You can open `policy.yaml` and change these — the system picks up your edits automatically.
 
+In one line: the guardian is a policy engine sitting between "agent decides" and "agent acts," and `policy.yaml` is the only place those decisions are defined.
+
 ## What's real vs. simulated
 
 - **Real:** the LLM calls, the rule checking, the approve/reject flow, the database log, the web dashboard.
