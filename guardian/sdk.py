@@ -37,6 +37,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable
 
+import pydantic
+
 import db
 import guardian.escalation as esc
 import guardian.executors as executors
@@ -69,6 +71,27 @@ class NoActiveContext(Exception):
     requesting_agent from, say, the calling module's __name__ -- would be a
     silent, spoofable substitute for the one thing (identity) this system
     refuses to let anything but trusted code set."""
+
+
+class InvalidActionParams(Exception):
+    """The caller's arguments don't satisfy `spec.params_model` (wrong type,
+    missing required field, failed a pydantic validator). Wraps pydantic's
+    own ValidationError as __cause__ rather than letting it escape directly
+    -- the raw pydantic exception is an implementation detail of how
+    params_model happens to be built (a customer could swap in a different
+    validation library behind ActionSpec in principle), and this repo's
+    posture is that every boundary a customer's calling code has to catch
+    exposes a typed exception from this module, not a third-party one. No
+    Action has been constructed yet at this point (target isn't known until
+    params validates), so unlike ActionDenied/ActionPending there is no
+    action_id to attach -- there is nothing to look up in the audit trail
+    because nothing was ever proposed."""
+
+    def __init__(self, action_type: str, original: pydantic.ValidationError):
+        super().__init__(
+            f"invalid params for action_type={action_type!r}: {original}"
+        )
+        self.action_type = action_type
 
 
 class ActionDenied(Exception):
@@ -121,7 +144,45 @@ def context(*, session_id: str, requesting_agent: str, conn: sqlite3.Connection,
     block, on THIS execution context only (contextvars, not a global -- safe
     under asyncio tasks and threads started via contextvars-aware means; a
     plain thread started without copying the context will not inherit it,
-    same as any other contextvars use)."""
+    same as any other contextvars use).
+
+    **Wiring this into a thread-dispatched framework (read this if you're
+    integrating LangGraph, CrewAI, or anything else that runs your tool
+    function through `concurrent.futures.ThreadPoolExecutor.submit()`):**
+
+    `ThreadPoolExecutor.submit()` does NOT propagate contextvars to the
+    worker thread -- the submitted function sees this contextvar's default
+    (`None`), not whatever `context()` bound in the calling thread, even if
+    that `with context(...):` block is still open on the stack above the
+    submit() call. This is a `contextvars` limitation, not a Guardian one:
+    Guardian has no hook into how your framework schedules the call, so it
+    cannot force propagation from inside this module (see the module
+    docstring, point 2, for why identity is contextvar-bound at all rather
+    than a plain function argument). Concretely:
+
+        # BROKEN: the worker thread does not see ctx bound in the caller.
+        # issue_refund() raises NoActiveContext even though context(...) is
+        # active on the submitting thread's stack.
+        with guardian.sdk.context(session_id=sid, requesting_agent=agent, conn=conn):
+            future = executor.submit(issue_refund, customer_id="c1", amount_cents=500)
+
+        # CORRECT: capture the current context and replay it inside the
+        # worker via Context.run -- copy_context() snapshots every
+        # contextvar bound in the calling thread (this one included), and
+        # ctx.run(fn, *args) invokes fn with that snapshot active.
+        import contextvars
+
+        with guardian.sdk.context(session_id=sid, requesting_agent=agent, conn=conn):
+            ctx = contextvars.copy_context()
+            future = executor.submit(ctx.run, issue_refund, customer_id="c1", amount_cents=500)
+
+    Do this once, at the adapter boundary where your framework hands off to
+    a worker thread -- e.g. wherever your LangGraph/CrewAI tool node itself
+    calls or is called via `executor.submit(...)`. `asyncio.to_thread()` is
+    NOT affected by this -- it copies the current context before running
+    the target in the thread pool, same as this pattern does by hand, so no
+    extra wiring is needed there.
+    """
     token = _current.set(_Context(session_id, requesting_agent, conn, policy_path))
     try:
         yield
@@ -358,7 +419,10 @@ def guarded(spec: ActionSpec):
                 )
             bound = signature.bind(*args, **kwargs)
             bound.apply_defaults()
-            params = spec.params_model(**bound.arguments)
+            try:
+                params = spec.params_model(**bound.arguments)
+            except pydantic.ValidationError as e:
+                raise InvalidActionParams(spec.action_type, e) from e
             target = getattr(params, spec.target_field)
             action = Action(
                 session_id=ctx.session_id,
