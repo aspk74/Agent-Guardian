@@ -157,3 +157,33 @@ main.py           the command-line tool (run / resolve / report / coverage-check
 tests/            86 automated tests
 guardian.db       the log of everything that's happened (created on first run)
 ```
+
+---
+
+## Wiring Guardian into an external agent framework
+
+The three agents above are a self-contained demo. If you're running your own agents — PraisonAI, Google ADK, Agno, LangGraph, CrewAI, or anything else — you can put Guardian in front of their real actions without changing Guardian's code, using `guardian/sdk.py`.
+
+### 1. Register your action type
+
+`ActionType`/`Params` is an open registry, not a fixed list. Wrap the function your agent already calls to do the real thing:
+
+```python
+from pydantic import BaseModel
+from guardian.sdk import guarded, ActionSpec
+
+class RefundParams(BaseModel):
+    customer_id: str
+    amount_cents: int
+
+@guarded(ActionSpec(
+    action_type="issue_refund",
+    params_model=RefundParams,
+    target_field="customer_id",   # must be a real field on RefundParams
+))
+def issue_refund(customer_id: str, amount_cents: int):
+    stripe.Refund.create(...)     # your real effector code, untouched
+    return {"status": "refunded"}
+```
+
+`target_field` names the field policy rules key on (e.g. "block anyone not on the vendor list"). It has to be a real, declared field — never something the LLM phrases at call time — because a rule needs a stable value to compare against.
