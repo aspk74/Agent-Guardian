@@ -187,3 +187,20 @@ def issue_refund(customer_id: str, amount_cents: int):
 ```
 
 `target_field` names the field policy rules key on (e.g. "block anyone not on the vendor list"). It has to be a real, declared field — never something the LLM phrases at call time — because a rule needs a stable value to compare against.
+
+### 2. Wrap the call site with identity
+
+Wherever your framework actually invokes the tool, wrap it in `guardian.sdk.context()` so Guardian knows who's asking:
+
+```python
+import guardian.sdk as sdk
+
+with sdk.context(session_id=session_id, requesting_agent="refund-bot", conn=conn):
+    issue_refund(customer_id="cust-1", amount_cents=25_000)
+```
+
+Guardian evaluates the call against `policy.yaml` before `issue_refund`'s real body runs:
+
+- **Allowed** — your function executes normally; its return value is captured in the audit trail.
+- **Denied** — raises `ActionDenied` instead of running your function.
+- **Needs a human** — raises `ActionPending`. Retry the exact same call later: it either raises `ActionPending` again (still waiting), executes and returns normally (approved since your last try), or raises `ActionDenied` (rejected).
