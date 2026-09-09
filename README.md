@@ -215,3 +215,7 @@ Same `policy.yaml` format as the built-in demo rules — nothing else in Guardia
   when: {action_type: issue_refund, amount_cents_gt: 20000}
   then: escalate
 ```
+
+### What this does and doesn't guarantee
+
+This SDK gives you real policy evaluation, a real approval queue, and a real audit trail. It does **not** make it impossible for your agent's code to bypass Guardian and call the real effector directly — your framework's process still legitimately holds its own credentials (API keys, SMTP creds, etc.), and nothing stops code that skips the `@guarded` wrapper. Treat this as "the correct path is enforced," not "the only path is enforced." A stronger guarantee would require credentials to live outside the deciding process entirely — that's a separate, not-yet-built architecture.
