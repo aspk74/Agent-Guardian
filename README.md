@@ -219,3 +219,17 @@ Same `policy.yaml` format as the built-in demo rules — nothing else in Guardia
 ### What this does and doesn't guarantee
 
 This SDK gives you real policy evaluation, a real approval queue, and a real audit trail. It does **not** make it impossible for your agent's code to bypass Guardian and call the real effector directly — your framework's process still legitimately holds its own credentials (API keys, SMTP creds, etc.), and nothing stops code that skips the `@guarded` wrapper. Treat this as "the correct path is enforced," not "the only path is enforced." A stronger guarantee would require credentials to live outside the deciding process entirely — that's a separate, not-yet-built architecture.
+
+### If your framework dispatches tool calls to a thread pool
+
+`ThreadPoolExecutor.submit()` (used internally by some LangGraph/CrewAI setups) does not carry Python's `contextvars` into the worker thread, so `context()` won't be visible there by default. Capture and replay it explicitly:
+
+```python
+import contextvars
+
+with sdk.context(session_id=sid, requesting_agent=agent, conn=conn):
+    ctx = contextvars.copy_context()
+    future = executor.submit(ctx.run, issue_refund, customer_id="c1", amount_cents=500)
+```
+
+`asyncio.to_thread()` doesn't have this problem — it copies context automatically.
