@@ -204,3 +204,14 @@ Guardian evaluates the call against `policy.yaml` before `issue_refund`'s real b
 - **Allowed** — your function executes normally; its return value is captured in the audit trail.
 - **Denied** — raises `ActionDenied` instead of running your function.
 - **Needs a human** — raises `ActionPending`. Retry the exact same call later: it either raises `ActionPending` again (still waiting), executes and returns normally (approved since your last try), or raises `ActionDenied` (rejected).
+
+### 3. Write policy rules for the new action type
+
+Same `policy.yaml` format as the built-in demo rules — nothing else in Guardian needs to change:
+
+```yaml
+- id: REFUND-001
+  description: Refunds over $200 need a human
+  when: {action_type: issue_refund, amount_cents_gt: 20000}
+  then: escalate
+```
